@@ -19,15 +19,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply proven diagnostic HW-SPI transport
+      - name: Restore proven one-shot diagnostic transport
         shell: bash
         run: |
-          python .github/t42_patch_run21.py
-
-      - name: Apply pre-WiFi warm-panel fix
-        shell: bash
-        run: |
-          python .github/t42_patch_run23.py
+          git checkout ecb417474d96298c0e0370f38b8b3c8ddad8e8e5 -- main/boards/bread-compact-esp32/esp32_bread_board.cc
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('main/boards/bread-compact-esp32/esp32_bread_board.cc')
+          s = p.read_text()
+          old = 'line[i] = (i < kEpdLineBytes / 2) ? 0x00 : 0xFF;'
+          assert old in s
+          s = s.replace(old, 'line[i] = 0xFF;', 1)
+          s = s.replace('800x480 split pattern', '800x480 ONE-SHOT WHITE RECOVERY', 1)
+          s = s.replace('split black-white image', 'full-white recovery image', 1)
+          s = s.replace('holding image for 3 seconds', 'holding white image for 10 seconds', 1)
+          s = s.replace('vTaskDelay(pdMS_TO_TICKS(3000));', 'vTaskDelay(pdMS_TO_TICKS(10000));', 1)
+          p.write_text(s)
+          print('One-shot white recovery patch applied')
+          PY
 
       - name: Build T42 firmware
         shell: bash
