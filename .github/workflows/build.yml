@@ -42,8 +42,19 @@ jobs:
               anchor, 1)
           hp.write_text(h)
 
+          cp = Path('main/boards/bread-compact-esp32/config.h')
+          c = cp.read_text()
+          old = '#define EPD_SPI_CLOCK_HZ        (4 * 1000 * 1000)\n'
+          assert old in c
+          c = c.replace(old, '#define EPD_SPI_CLOCK_HZ        (2 * 1000 * 1000)\n', 1)
+          cp.write_text(c)
+
           sp = Path('main/boards/bread-compact-esp32/epaper_display_t42.cc')
           s = sp.read_text()
+
+          old = 'constexpr size_t kSpiChunk = 4096;\n'
+          assert old in s
+          s = s.replace(old, 'constexpr size_t kSpiChunk = 256;\n', 1)
 
           anchor = "        area->x1 != 0 || area->x2 != (EPD_WIDTH - 1)) {\n"
           assert anchor in s
@@ -185,6 +196,21 @@ jobs:
           assert anchor in s
           s = s.replace(anchor, busy_cycle_func + anchor, 1)
 
+          old = "bool EpaperDisplayT42::InitPanelFullRefresh() {\n    PowerRail(true);\n    HardwareReset();\n"
+          new = (
+              "bool EpaperDisplayT42::InitPanelFullRefresh() {\n"
+              "    // Hard-cycle the Rev2.3 HAT before every full refresh. This mirrors\n"
+              "    // the proven boot diagnostic and recovers a controller left BUSY-low\n"
+              "    // by an interrupted/failed previous refresh.\n"
+              "    PowerRail(false);\n"
+              "    vTaskDelay(pdMS_TO_TICKS(500));\n"
+              "    PowerRail(true);\n"
+              "    HardwareReset();\n"
+              "    ESP_LOGI(TAG, \"After hard-cycle/reset BUSY=%d\", gpio_get_level(EPD_BUSY_PIN));\n"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
           old = (
               "    SendCommand(0x50); // VCOM / DATA INTERVAL\n"
               "    SendData(0x10);\n"
@@ -212,7 +238,7 @@ jobs:
               '    if (!ok) {\n'
               '        ESP_LOGE(TAG, "DISPLAY REFRESH BUSY cycle failed; hard power reset");\n'
               '        PowerRail(false);\n'
-              '        vTaskDelay(pdMS_TO_TICKS(300));\n'
+              '        vTaskDelay(pdMS_TO_TICKS(500));\n'
               '        ESP_LOGI(TAG, "Full refresh failed");\n'
               '        return false;\n'
               '    }\n\n'
@@ -227,7 +253,7 @@ jobs:
           s = s.replace(old, new, 1)
 
           sp.write_text(s)
-          print('T42 pipeline + BUSY-cycle rewrite applied successfully')
+          print('T42 proven 2MHz/256B + hard-cycle + BUSY rewrite applied successfully')
           PY
 
       - name: Build T42 firmware
