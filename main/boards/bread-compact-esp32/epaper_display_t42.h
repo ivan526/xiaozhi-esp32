@@ -9,6 +9,10 @@
 #include <freertos/task.h>
 #include <lvgl.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
 class EpaperDisplayT42 : public LcdDisplay {
 public:
     EpaperDisplayT42();
@@ -16,10 +20,19 @@ public:
 
     bool IsReady() const { return ready_; }
 
+    void SetupUI() override;
+    void SetStatus(const char* status) override;
+    void ShowNotification(const char* notification, int duration_ms = 3000) override;
+    void ShowNotification(const std::string& notification, int duration_ms = 3000) override;
+    void SetEmotion(const char* emotion) override;
+    void SetChatMessage(const char* role, const char* content) override;
+    void ClearChatMessages() override;
+    void UpdateStatusBar(bool update_all = false) override;
+    void SetPowerSaveMode(bool on) override;
+
 private:
-    // Keep only a tiny LVGL strip buffer. The previous implementation kept an
-    // additional 800x480x1bpp framebuffer (48,000 bytes) in internal SRAM,
-    // which left too little contiguous heap for Xiaozhi's Opus decoder.
+    // 800 x 4 rows x RGB565 = 6,400 bytes. Keep the display footprint small so
+    // the classic ESP32 still has enough contiguous SRAM for Opus/audio.
     static constexpr int LVGL_BUFFER_ROWS = 4;
     static constexpr size_t MONO_LINE_BYTES = EPD_WIDTH / 8;
 
@@ -29,10 +42,19 @@ private:
     TaskHandle_t refresh_task_handle_ = nullptr;
 
     bool ready_ = false;
-    bool first_refresh_ = true;
     bool power_rail_on_ = false;
+    volatile bool speaking_ = false;
     volatile bool streaming_refresh_ = false;
+    volatile bool stream_invert_ = false;
     volatile bool stream_error_ = false;
+
+    lv_obj_t* title_label_ = nullptr;
+    lv_obj_t* user_label_ = nullptr;
+    lv_obj_t* assistant_label_ = nullptr;
+
+    std::string status_text_;
+    std::string user_text_;
+    std::string assistant_text_;
 
     static void LvglFlushCb(lv_display_t* disp, const lv_area_t* area, uint8_t* color_p);
     static void RefreshTaskEntry(void* arg);
@@ -41,16 +63,19 @@ private:
     bool InitializeHardware();
     bool InitializeLvgl();
     void NotifyRefresh();
-    bool StreamCurrentUiToPanel();
+    bool StreamCurrentUiToPanel(bool invert);
+
+    void UpdateUserLabelLocked();
+    void UpdateAssistantLabelLocked();
+    static std::string TruncateUtf8(const std::string& text, size_t max_bytes);
 
     esp_err_t SpiWrite(const uint8_t* data, size_t len);
     void SendCommand(uint8_t cmd);
     void SendData(uint8_t data);
-    void SendRepeated(uint8_t value, size_t len);
 
     void PowerRail(bool on);
     void HardwareReset();
-    bool WaitBusy(const char* reason, uint32_t timeout_ms);
+    bool WaitBusyRelease(const char* reason, uint32_t timeout_ms);
     bool InitPanelFullRefresh();
     bool RefreshPanelFull();
     void SleepAndPowerOff();

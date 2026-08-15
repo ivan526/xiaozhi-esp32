@@ -1,19 +1,26 @@
 #include "epaper_display_t42.h"
 #include "config.h"
+#include "assets/lang_config.h"
 
 #include <algorithm>
 #include <cstring>
 
 #include <driver/gpio.h>
+#include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
+#include <esp_rom_sys.h>
 
 #define TAG "EpaperT42"
+
+LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 
 namespace {
 constexpr spi_host_device_t kSpiHost = SPI3_HOST;
 constexpr size_t kSpiChunk = 4096;
+constexpr size_t kMaxUserBytes = 240;
+constexpr size_t kMaxAssistantBytes = 780;
 }
 
 EpaperDisplayT42::EpaperDisplayT42()
@@ -45,7 +52,7 @@ EpaperDisplayT42::EpaperDisplayT42()
 
     ready_ = true;
     ESP_LOGI(TAG,
-             "Ready: 800x480 T42/UC8179, PWR=%d BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
+             "Ready: 800x480 T42 e-paper, PWR=%d BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
              EPD_PWR_PIN, EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN,
              EPD_CS_PIN, EPD_SCLK_PIN, EPD_MOSI_PIN);
     ESP_LOGI(TAG, "Heap after e-paper: free=%u largest=%u",
@@ -95,8 +102,7 @@ bool EpaperDisplayT42::InitializeHardware() {
     gpio_config_t busy_cfg = {};
     busy_cfg.pin_bit_mask = (1ULL << EPD_BUSY_PIN);
     busy_cfg.mode = GPIO_MODE_INPUT;
-    // GPIO34 is input-only and has no internal pull-up on classic ESP32.
-    // The Waveshare HAT actively drives BUSY, so no pull resistor is needed.
+    // GPIO34 has no internal pull resistor on classic ESP32. The HAT drives BUSY.
     busy_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     busy_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     busy_cfg.intr_type = GPIO_INTR_DISABLE;
@@ -135,12 +141,10 @@ bool EpaperDisplayT42::InitializeHardware() {
         return false;
     }
 
-    // One monochrome scan line is only 100 bytes for an 800px-wide panel.
     mono_line_ = static_cast<uint8_t*>(
         heap_caps_malloc(MONO_LINE_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
     if (mono_line_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate %u-byte monochrome line buffer",
-                 static_cast<unsigned>(MONO_LINE_BYTES));
+        ESP_LOGE(TAG, "Failed to allocate monochrome line buffer");
         spi_bus_remove_device(spi_);
         spi_ = nullptr;
         spi_bus_free(kSpiHost);
@@ -165,8 +169,6 @@ bool EpaperDisplayT42::InitializeLvgl() {
         return false;
     }
 
-    // 800 x 4 rows x RGB565 = 6,400 bytes instead of a permanent 48KB
-    // monochrome framebuffer plus the LVGL buffer.
     const size_t buffer_size =
         EPD_WIDTH * LVGL_BUFFER_ROWS *
         LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565);
@@ -201,6 +203,217 @@ bool EpaperDisplayT42::InitializeLvgl() {
     return true;
 }
 
+void EpaperDisplayT42::SetupUI() {
+    if (setup_ui_called_) {
+        return;
+    }
+
+    Display::SetupUI();
+    DisplayLockGuard lock(this);
+
+    lv_obj_t* screen = lv_display_get_screen_active(display_);
+    if (screen == nullptr) {
+        ESP_LOGE(TAG, "No active LVGL screen");
+        return;
+    }
+
+    lv_obj_clean(screen);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(screen, lv_color_black(), 0);
+    lv_obj_set_style_text_font(screen, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_pad_all(screen, 0, 0);
+
+    title_label_ = lv_label_create(screen);
+    lv_label_set_text(title_label_, "小智");
+    lv_obj_set_pos(title_label_, 32, 20);
+    lv_obj_set_style_text_color(title_label_, lv_color_black(), 0);
+    lv_obj_set_style_text_font(title_label_, &BUILTIN_TEXT_FONT, 0);
+
+    status_label_ = lv_label_create(screen);
+    status_text_ = "正在启动";
+    lv_label_set_text(status_label_, status_text_.c_str());
+    lv_obj_set_width(status_label_, 560);
+    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(status_label_, lv_color_black(), 0);
+    lv_obj_set_style_text_font(status_label_, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_align(status_label_, LV_ALIGN_TOP_RIGHT, -32, 20);
+
+    auto add_divider = [screen](int y) {
+        lv_obj_t* line = lv_obj_create(screen);
+        lv_obj_set_pos(line, 32, y);
+        lv_obj_set_size(line, EPD_WIDTH - 64, 2);
+        lv_obj_set_style_radius(line, 0, 0);
+        lv_obj_set_style_border_width(line, 0, 0);
+        lv_obj_set_style_pad_all(line, 0, 0);
+        lv_obj_set_style_bg_color(line, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    };
+
+    add_divider(58);
+    add_divider(188);
+
+    user_label_ = lv_label_create(screen);
+    lv_obj_set_pos(user_label_, 32, 80);
+    lv_obj_set_size(user_label_, EPD_WIDTH - 64, 88);
+    lv_label_set_long_mode(user_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(user_label_, lv_color_black(), 0);
+    lv_obj_set_style_text_font(user_label_, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_text_line_space(user_label_, 5, 0);
+
+    assistant_label_ = lv_label_create(screen);
+    lv_obj_set_pos(assistant_label_, 32, 210);
+    lv_obj_set_size(assistant_label_, EPD_WIDTH - 64, 238);
+    lv_label_set_long_mode(assistant_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(assistant_label_, lv_color_black(), 0);
+    lv_obj_set_style_text_font(assistant_label_, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_text_line_space(assistant_label_, 6, 0);
+
+    UpdateUserLabelLocked();
+    UpdateAssistantLabelLocked();
+
+    ESP_LOGI(TAG, "E-paper compact UI ready");
+    NotifyRefresh();
+}
+
+std::string EpaperDisplayT42::TruncateUtf8(const std::string& text, size_t max_bytes) {
+    if (text.size() <= max_bytes) {
+        return text;
+    }
+
+    size_t end = max_bytes;
+    while (end > 0 && end < text.size() &&
+           (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
+        --end;
+    }
+    return text.substr(0, end) + "...";
+}
+
+void EpaperDisplayT42::UpdateUserLabelLocked() {
+    if (user_label_ == nullptr) {
+        return;
+    }
+    std::string text = "你：";
+    text += user_text_.empty() ? "等待你说话" : TruncateUtf8(user_text_, kMaxUserBytes);
+    lv_label_set_text(user_label_, text.c_str());
+}
+
+void EpaperDisplayT42::UpdateAssistantLabelLocked() {
+    if (assistant_label_ == nullptr) {
+        return;
+    }
+    std::string text = "小智：";
+    text += assistant_text_.empty() ? "准备好了，随时可以聊。" : TruncateUtf8(assistant_text_, kMaxAssistantBytes);
+    lv_label_set_text(assistant_label_, text.c_str());
+}
+
+void EpaperDisplayT42::SetStatus(const char* status) {
+    if (status == nullptr) {
+        return;
+    }
+
+    Display::SetStatus(status);
+    const bool is_speaking = (std::strcmp(status, Lang::Strings::SPEAKING) == 0);
+    speaking_ = is_speaking;
+    status_text_ = status;
+
+    if (setup_ui_called_ && status_label_ != nullptr) {
+        DisplayLockGuard lock(this);
+        lv_label_set_text(status_label_, status_text_.c_str());
+    }
+
+    // During TTS playback we intentionally do not full-refresh. Assistant
+    // sentence_start events accumulate in RAM; when speaking ends the next
+    // status change triggers one final e-paper update with the complete answer.
+    if (!is_speaking) {
+        NotifyRefresh();
+    }
+}
+
+void EpaperDisplayT42::ShowNotification(const char* notification, int duration_ms) {
+    (void)duration_ms;
+    if (notification == nullptr || notification[0] == '\0') {
+        return;
+    }
+    Display::ShowNotification(notification, duration_ms);
+    status_text_ = notification;
+    if (setup_ui_called_ && status_label_ != nullptr) {
+        DisplayLockGuard lock(this);
+        lv_label_set_text(status_label_, status_text_.c_str());
+    }
+    if (!speaking_) {
+        NotifyRefresh();
+    }
+}
+
+void EpaperDisplayT42::ShowNotification(const std::string& notification, int duration_ms) {
+    ShowNotification(notification.c_str(), duration_ms);
+}
+
+void EpaperDisplayT42::SetEmotion(const char* emotion) {
+    // E-paper UI intentionally avoids animated emoji/emotion redraws.
+    Display::SetEmotion(emotion != nullptr ? emotion : "");
+}
+
+void EpaperDisplayT42::SetChatMessage(const char* role, const char* content) {
+    if (role == nullptr || content == nullptr) {
+        return;
+    }
+
+    Display::SetChatMessage(role, content);
+
+    bool changed = false;
+    if (std::strcmp(role, "user") == 0) {
+        user_text_ = content;
+        assistant_text_.clear();
+        changed = true;
+    } else if (std::strcmp(role, "assistant") == 0) {
+        if (content[0] != '\0') {
+            assistant_text_ += content;
+            changed = true;
+        }
+    } else if (std::strcmp(role, "system") == 0) {
+        // Hide the startup user-agent string, but keep useful system/alert text
+        // such as Wi-Fi configuration instructions.
+        if (content[0] != '\0' && std::strstr(content, "bread-compact-esp32") == nullptr) {
+            assistant_text_ = content;
+            changed = true;
+        }
+    }
+
+    if (!changed) {
+        return;
+    }
+
+    if (setup_ui_called_) {
+        DisplayLockGuard lock(this);
+        UpdateUserLabelLocked();
+        UpdateAssistantLabelLocked();
+    }
+
+    if (!speaking_) {
+        NotifyRefresh();
+    }
+}
+
+void EpaperDisplayT42::ClearChatMessages() {
+    // Preserve the last Q&A on an e-paper screen. A new user utterance replaces
+    // it naturally, so idle-state transitions do not erase useful content.
+    ESP_LOGI(TAG, "Preserve last Q&A on ClearChatMessages");
+}
+
+void EpaperDisplayT42::UpdateStatusBar(bool update_all) {
+    (void)update_all;
+    // Intentionally no 1 Hz clock/network redraws on e-paper.
+}
+
+void EpaperDisplayT42::SetPowerSaveMode(bool on) {
+    (void)on;
+    // Panel power is controlled per refresh via EPD_PWR_PIN.
+}
+
 void EpaperDisplayT42::LvglFlushCb(
     lv_display_t* disp,
     const lv_area_t* area,
@@ -211,12 +424,9 @@ void EpaperDisplayT42::LvglFlushCb(
         return;
     }
 
-    // Normal Xiaozhi UI updates only mark the screen dirty. We deliberately do
-    // not keep a full framebuffer. After the UI has been quiet for a short
-    // period the refresh task invalidates the full screen and LVGL renders it
-    // again, four rows at a time, directly into the e-paper controller RAM.
+    // Normal LVGL draws only update the in-memory UI model. Physical refreshes
+    // are scheduled explicitly by SetStatus/SetChatMessage/SetupUI.
     if (!self->streaming_refresh_) {
-        self->NotifyRefresh();
         lv_display_flush_ready(disp);
         return;
     }
@@ -238,9 +448,6 @@ void EpaperDisplayT42::LvglFlushCb(
 
         for (int x = 0; x < EPD_WIDTH; ++x) {
             const uint16_t p = pixels[row * EPD_WIDTH + x];
-
-            // RGB565 luminance approximation. T42 is monochrome, so Xiaozhi's
-            // colored UI is thresholded to black/white.
             const uint32_t r = (p >> 11) & 0x1F;
             const uint32_t g = (p >> 5) & 0x3F;
             const uint32_t b = p & 0x1F;
@@ -252,6 +459,12 @@ void EpaperDisplayT42::LvglFlushCb(
             if (lum < 128000) {
                 self->mono_line_[x >> 3] &=
                     static_cast<uint8_t>(~(0x80 >> (x & 7)));
+            }
+        }
+
+        if (self->stream_invert_) {
+            for (size_t i = 0; i < MONO_LINE_BYTES; ++i) {
+                self->mono_line_[i] = static_cast<uint8_t>(~self->mono_line_[i]);
             }
         }
 
@@ -279,11 +492,14 @@ void EpaperDisplayT42::RefreshTaskLoop() {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        // Coalesce Xiaozhi's rapidly changing state/text into one e-paper
-        // update. This is especially important for streamed AI responses.
         while (ulTaskNotifyTake(
                    pdTRUE,
                    pdMS_TO_TICKS(EPD_REFRESH_DEBOUNCE_MS)) > 0) {
+        }
+
+        if (speaking_) {
+            ESP_LOGI(TAG, "Refresh deferred while TTS is speaking");
+            continue;
         }
 
         if (!RefreshPanelFull()) {
@@ -292,17 +508,15 @@ void EpaperDisplayT42::RefreshTaskLoop() {
     }
 }
 
-bool EpaperDisplayT42::StreamCurrentUiToPanel() {
+bool EpaperDisplayT42::StreamCurrentUiToPanel(bool invert) {
     if (display_ == nullptr) {
         return false;
     }
 
     stream_error_ = false;
     streaming_refresh_ = true;
+    stream_invert_ = invert;
 
-    // LVGL 9 can redraw invalidated content immediately. In PARTIAL render
-    // mode the 6.4KB buffer yields full-width strips, which the flush callback
-    // converts to 1bpp and sends straight to UC8179 RAM.
     lvgl_port_lock(0);
     lv_obj_t* screen = lv_display_get_screen_active(display_);
     if (screen != nullptr) {
@@ -313,6 +527,7 @@ bool EpaperDisplayT42::StreamCurrentUiToPanel() {
     }
     lvgl_port_unlock();
 
+    stream_invert_ = false;
     streaming_refresh_ = false;
     return !stream_error_;
 }
@@ -348,43 +563,30 @@ void EpaperDisplayT42::SendData(uint8_t data) {
     ESP_ERROR_CHECK_WITHOUT_ABORT(SpiWrite(&data, 1));
 }
 
-void EpaperDisplayT42::SendRepeated(uint8_t value, size_t len) {
-    uint8_t block[256];
-    std::memset(block, value, sizeof(block));
-
-    gpio_set_level(EPD_DC_PIN, 1);
-    while (len > 0) {
-        const size_t n = std::min(len, sizeof(block));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(SpiWrite(block, n));
-        len -= n;
-    }
-}
-
 void EpaperDisplayT42::PowerRail(bool on) {
     gpio_set_level(EPD_PWR_PIN, on ? 1 : 0);
     power_rail_on_ = on;
     if (on) {
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 void EpaperDisplayT42::HardwareReset() {
+    // Verified with the working diagnostic build / Waveshare Rev2.3 timing.
     gpio_set_level(EPD_RST_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level(EPD_RST_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    esp_rom_delay_us(2000);
     gpio_set_level(EPD_RST_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(20));
 }
 
-bool EpaperDisplayT42::WaitBusy(const char* reason, uint32_t timeout_ms) {
+bool EpaperDisplayT42::WaitBusyRelease(const char* reason, uint32_t timeout_ms) {
     const TickType_t start = xTaskGetTickCount();
-    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
-
-    // UC8179 / Waveshare 7.5" HAT BUSY is active LOW in this verified setup.
     while (gpio_get_level(EPD_BUSY_PIN) == 0) {
-        if ((xTaskGetTickCount() - start) > timeout_ticks) {
-            ESP_LOGE(TAG, "BUSY timeout while %s", reason);
+        if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(timeout_ms)) {
+            ESP_LOGE(TAG, "BUSY timeout while %s, level=%d",
+                     reason, gpio_get_level(EPD_BUSY_PIN));
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -396,15 +598,13 @@ bool EpaperDisplayT42::InitPanelFullRefresh() {
     PowerRail(true);
     HardwareReset();
 
-    SendCommand(0x00); // PANEL SETTING
-    SendData(0x1F);
-
+    // Sequence proven by the split-screen hardware self-test after CS wiring
+    // was corrected. This mirrors the Waveshare 7.5-inch V2 full-refresh path.
     SendCommand(0x01); // POWER SETTING
     SendData(0x07);
     SendData(0x07);
     SendData(0x3F);
     SendData(0x3F);
-    SendData(0x09);
 
     SendCommand(0x06); // BOOSTER SOFT START
     SendData(0x17);
@@ -412,61 +612,61 @@ bool EpaperDisplayT42::InitPanelFullRefresh() {
     SendData(0x28);
     SendData(0x17);
 
-    SendCommand(0x61); // RESOLUTION: 800 x 480
-    SendData(static_cast<uint8_t>(EPD_WIDTH >> 8));
-    SendData(static_cast<uint8_t>(EPD_WIDTH & 0xFF));
-    SendData(static_cast<uint8_t>(EPD_HEIGHT >> 8));
-    SendData(static_cast<uint8_t>(EPD_HEIGHT & 0xFF));
+    SendCommand(0x04); // POWER ON
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!WaitBusyRelease("power-on", 5000)) {
+        return false;
+    }
 
-    SendCommand(0x15); // DUAL SPI disabled
+    SendCommand(0x00); // PANEL SETTING
+    SendData(0x1F);
+
+    SendCommand(0x61); // 800 x 480
+    SendData(0x03);
+    SendData(0x20);
+    SendData(0x01);
+    SendData(0xE0);
+
+    SendCommand(0x15);
     SendData(0x00);
 
     SendCommand(0x50); // VCOM / DATA INTERVAL
-    SendData(0x29);
+    SendData(0x10);
     SendData(0x07);
 
     SendCommand(0x60); // TCON
     SendData(0x22);
 
-    SendCommand(0xE3); // POWER SAVING
-    SendData(0x22);
-
-    SendCommand(0x04); // POWER ON
-    return WaitBusy("power-on", 3000);
+    return true;
 }
 
 bool EpaperDisplayT42::RefreshPanelFull() {
-    ESP_LOGI(TAG, "Full refresh begin (low-memory streaming)");
+    ESP_LOGI(TAG, "Full refresh begin (compact UI, two-plane streaming)");
 
     if (!InitPanelFullRefresh()) {
         SleepAndPowerOff();
         return false;
     }
 
-    // Initialize previous-image RAM to white on the first update.
-    if (first_refresh_) {
-        SendCommand(0x10);
-        SendRepeated(0xFF, static_cast<size_t>(EPD_WIDTH) * EPD_HEIGHT / 8);
-        first_refresh_ = false;
-    }
-
-    // Select current-image RAM, then ask LVGL to render the entire UI. The
-    // flush callback streams each 800px strip directly to the controller.
-    SendCommand(0x13);
-    if (!StreamCurrentUiToPanel()) {
-        ESP_LOGE(TAG, "LVGL-to-e-paper streaming failed");
+    // Waveshare's monochrome 7.5-inch path writes the image to 0x10 and the
+    // inverse image to 0x13. Render the LVGL screen twice without a 48KB frame.
+    SendCommand(0x10);
+    if (!StreamCurrentUiToPanel(false)) {
+        ESP_LOGE(TAG, "LVGL plane 0x10 streaming failed");
         SleepAndPowerOff();
         return false;
     }
 
-    // Use UC8179's internal temperature sensor for a conservative full update.
-    SendCommand(0xE0);
-    SendData(0x00);
-    SendCommand(0x41);
-    SendData(0x00);
+    SendCommand(0x13);
+    if (!StreamCurrentUiToPanel(true)) {
+        ESP_LOGE(TAG, "LVGL plane 0x13 streaming failed");
+        SleepAndPowerOff();
+        return false;
+    }
 
     SendCommand(0x12); // DISPLAY REFRESH
-    const bool ok = WaitBusy("full-refresh", EPD_BUSY_TIMEOUT_MS);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    const bool ok = WaitBusyRelease("display-refresh", EPD_BUSY_TIMEOUT_MS);
 
     SleepAndPowerOff();
     ESP_LOGI(TAG, "Full refresh %s", ok ? "done" : "failed");
@@ -479,11 +679,7 @@ void EpaperDisplayT42::SleepAndPowerOff() {
     }
 
     SendCommand(0x02); // POWER OFF
-    WaitBusy("power-off", 1500);
-
-    SendCommand(0x07); // DEEP SLEEP
-    SendData(0xA5);
-
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    WaitBusyRelease("power-off", 2000);
     PowerRail(false);
 }
