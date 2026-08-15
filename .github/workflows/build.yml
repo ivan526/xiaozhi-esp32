@@ -31,9 +31,9 @@ jobs:
           anchor = "    volatile bool stream_error_ = false;\n"
           assert anchor in h
           h = h.replace(anchor, anchor +
-              "    volatile int stream_rows_ = 0;\n"
-              "    volatile int stream_flushes_ = 0;\n"
-              "    volatile int stream_next_y_ = 0;\n", 1)
+              "    int stream_rows_ = 0;\n"
+              "    int stream_flushes_ = 0;\n"
+              "    int stream_next_y_ = 0;\n", 1)
           hp.write_text(h)
 
           sp = Path('main/boards/bread-compact-esp32/epaper_display_t42.cc')
