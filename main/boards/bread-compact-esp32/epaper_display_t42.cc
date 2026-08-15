@@ -18,21 +18,9 @@ constexpr size_t kSpiChunk = 4096;
 
 EpaperDisplayT42::EpaperDisplayT42()
     : LcdDisplay(nullptr, nullptr, EPD_WIDTH, EPD_HEIGHT) {
-    framebuffer_mutex_ = xSemaphoreCreateMutex();
-    if (framebuffer_mutex_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to create framebuffer mutex");
-        return;
-    }
-
-    // 800 * 480 / 8 = 48,000 bytes, one bit per pixel.
-    framebuffer_ = static_cast<uint8_t*>(
-        heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
-    if (framebuffer_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate %u-byte e-paper framebuffer",
-                 static_cast<unsigned>(FRAME_BYTES));
-        return;
-    }
-    std::memset(framebuffer_, 0xFF, FRAME_BYTES); // 1 = white
+    ESP_LOGI(TAG, "Heap before e-paper: free=%u largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
 
     if (!InitializeHardware()) {
         ESP_LOGE(TAG, "Hardware initialization failed");
@@ -60,6 +48,9 @@ EpaperDisplayT42::EpaperDisplayT42()
              "Ready: 800x480 T42/UC8179, PWR=%d BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
              EPD_PWR_PIN, EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN,
              EPD_CS_PIN, EPD_SCLK_PIN, EPD_MOSI_PIN);
+    ESP_LOGI(TAG, "Heap after e-paper: free=%u largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
 }
 
 EpaperDisplayT42::~EpaperDisplayT42() {
@@ -67,23 +58,23 @@ EpaperDisplayT42::~EpaperDisplayT42() {
         vTaskDelete(refresh_task_handle_);
         refresh_task_handle_ = nullptr;
     }
+
     SleepAndPowerOff();
+
     if (spi_ != nullptr) {
         spi_bus_remove_device(spi_);
         spi_ = nullptr;
         spi_bus_free(kSpiHost);
     }
+
     if (lvgl_buffer_ != nullptr) {
         heap_caps_free(lvgl_buffer_);
         lvgl_buffer_ = nullptr;
     }
-    if (framebuffer_ != nullptr) {
-        heap_caps_free(framebuffer_);
-        framebuffer_ = nullptr;
-    }
-    if (framebuffer_mutex_ != nullptr) {
-        vSemaphoreDelete(framebuffer_mutex_);
-        framebuffer_mutex_ = nullptr;
+
+    if (mono_line_ != nullptr) {
+        heap_caps_free(mono_line_);
+        mono_line_ = nullptr;
     }
 }
 
@@ -105,7 +96,7 @@ bool EpaperDisplayT42::InitializeHardware() {
     busy_cfg.pin_bit_mask = (1ULL << EPD_BUSY_PIN);
     busy_cfg.mode = GPIO_MODE_INPUT;
     // GPIO34 is input-only and has no internal pull-up on classic ESP32.
-    // The Waveshare HAT actively drives BUSY, so no pull resistor is needed here.
+    // The Waveshare HAT actively drives BUSY, so no pull resistor is needed.
     busy_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     busy_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     busy_cfg.intr_type = GPIO_INTR_DISABLE;
@@ -144,11 +135,23 @@ bool EpaperDisplayT42::InitializeHardware() {
         return false;
     }
 
+    // One monochrome scan line is only 100 bytes for an 800px-wide panel.
+    mono_line_ = static_cast<uint8_t*>(
+        heap_caps_malloc(MONO_LINE_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+    if (mono_line_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate %u-byte monochrome line buffer",
+                 static_cast<unsigned>(MONO_LINE_BYTES));
+        spi_bus_remove_device(spi_);
+        spi_ = nullptr;
+        spi_bus_free(kSpiHost);
+        return false;
+    }
+
     return true;
 }
 
 bool EpaperDisplayT42::InitializeLvgl() {
-    ESP_LOGI(TAG, "Initialize LVGL for e-paper");
+    ESP_LOGI(TAG, "Initialize LVGL for low-memory e-paper streaming");
 
     lv_init();
 
@@ -162,6 +165,8 @@ bool EpaperDisplayT42::InitializeLvgl() {
         return false;
     }
 
+    // 800 x 4 rows x RGB565 = 6,400 bytes instead of a permanent 48KB
+    // monochrome framebuffer plus the LVGL buffer.
     const size_t buffer_size =
         EPD_WIDTH * LVGL_BUFFER_ROWS *
         LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565);
@@ -201,56 +206,67 @@ void EpaperDisplayT42::LvglFlushCb(
     const lv_area_t* area,
     uint8_t* color_p) {
     auto* self = static_cast<EpaperDisplayT42*>(lv_display_get_user_data(disp));
-    if (self == nullptr || self->framebuffer_ == nullptr) {
+    if (self == nullptr) {
         lv_display_flush_ready(disp);
         return;
     }
 
-    if (xSemaphoreTake(self->framebuffer_mutex_, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        auto* pixels = reinterpret_cast<uint16_t*>(color_p);
+    // Normal Xiaozhi UI updates only mark the screen dirty. We deliberately do
+    // not keep a full framebuffer. After the UI has been quiet for a short
+    // period the refresh task invalidates the full screen and LVGL renders it
+    // again, four rows at a time, directly into the e-paper controller RAM.
+    if (!self->streaming_refresh_) {
+        self->NotifyRefresh();
+        lv_display_flush_ready(disp);
+        return;
+    }
 
-        for (int y = area->y1; y <= area->y2; ++y) {
-            for (int x = area->x1; x <= area->x2; ++x) {
-                const uint16_t p = *pixels++;
+    if (self->mono_line_ == nullptr ||
+        area->x1 != 0 || area->x2 != (EPD_WIDTH - 1)) {
+        ESP_LOGE(TAG, "Unexpected LVGL stream area x=%d..%d y=%d..%d",
+                 area->x1, area->x2, area->y1, area->y2);
+        self->stream_error_ = true;
+        lv_display_flush_ready(disp);
+        return;
+    }
 
-                // RGB565 luminance approximation. T42 is monochrome, so
-                // Xiaozhi's colored UI is thresholded to black/white.
-                const uint32_t r = (p >> 11) & 0x1F;
-                const uint32_t g = (p >> 5) & 0x3F;
-                const uint32_t b = p & 0x1F;
-                const uint32_t lum =
-                    (r * 255 / 31) * 299 +
-                    (g * 255 / 63) * 587 +
-                    (b * 255 / 31) * 114;
+    auto* pixels = reinterpret_cast<uint16_t*>(color_p);
+    const int rows = area->y2 - area->y1 + 1;
 
-                self->SetPixel(x, y, lum < 128000);
+    for (int row = 0; row < rows; ++row) {
+        std::memset(self->mono_line_, 0xFF, MONO_LINE_BYTES); // 1 = white
+
+        for (int x = 0; x < EPD_WIDTH; ++x) {
+            const uint16_t p = pixels[row * EPD_WIDTH + x];
+
+            // RGB565 luminance approximation. T42 is monochrome, so Xiaozhi's
+            // colored UI is thresholded to black/white.
+            const uint32_t r = (p >> 11) & 0x1F;
+            const uint32_t g = (p >> 5) & 0x3F;
+            const uint32_t b = p & 0x1F;
+            const uint32_t lum =
+                (r * 255 / 31) * 299 +
+                (g * 255 / 63) * 587 +
+                (b * 255 / 31) * 114;
+
+            if (lum < 128000) {
+                self->mono_line_[x >> 3] &=
+                    static_cast<uint8_t>(~(0x80 >> (x & 7)));
             }
         }
 
-        xSemaphoreGive(self->framebuffer_mutex_);
-        self->NotifyRefresh();
+        gpio_set_level(EPD_DC_PIN, 1);
+        if (self->SpiWrite(self->mono_line_, MONO_LINE_BYTES) != ESP_OK) {
+            self->stream_error_ = true;
+            break;
+        }
     }
 
     lv_display_flush_ready(disp);
 }
 
-void EpaperDisplayT42::SetPixel(int x, int y, bool black) {
-    if (x < 0 || y < 0 || x >= EPD_WIDTH || y >= EPD_HEIGHT) {
-        return;
-    }
-
-    const size_t index = static_cast<size_t>(y) * (EPD_WIDTH / 8) + (x >> 3);
-    const uint8_t mask = static_cast<uint8_t>(0x80 >> (x & 7));
-
-    if (black) {
-        framebuffer_[index] &= static_cast<uint8_t>(~mask);
-    } else {
-        framebuffer_[index] |= mask;
-    }
-}
-
 void EpaperDisplayT42::NotifyRefresh() {
-    if (refresh_task_handle_ != nullptr) {
+    if (refresh_task_handle_ != nullptr && !streaming_refresh_) {
         xTaskNotifyGive(refresh_task_handle_);
     }
 }
@@ -263,7 +279,8 @@ void EpaperDisplayT42::RefreshTaskLoop() {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        // Coalesce Xiaozhi's rapidly changing status / streamed text.
+        // Coalesce Xiaozhi's rapidly changing state/text into one e-paper
+        // update. This is especially important for streamed AI responses.
         while (ulTaskNotifyTake(
                    pdTRUE,
                    pdMS_TO_TICKS(EPD_REFRESH_DEBOUNCE_MS)) > 0) {
@@ -273,6 +290,31 @@ void EpaperDisplayT42::RefreshTaskLoop() {
             ESP_LOGE(TAG, "Panel refresh failed");
         }
     }
+}
+
+bool EpaperDisplayT42::StreamCurrentUiToPanel() {
+    if (display_ == nullptr) {
+        return false;
+    }
+
+    stream_error_ = false;
+    streaming_refresh_ = true;
+
+    // LVGL 9 can redraw invalidated content immediately. In PARTIAL render
+    // mode the 6.4KB buffer yields full-width strips, which the flush callback
+    // converts to 1bpp and sends straight to UC8179 RAM.
+    lvgl_port_lock(0);
+    lv_obj_t* screen = lv_display_get_screen_active(display_);
+    if (screen != nullptr) {
+        lv_obj_invalidate(screen);
+        lv_refr_now(display_);
+    } else {
+        stream_error_ = true;
+    }
+    lvgl_port_unlock();
+
+    streaming_refresh_ = false;
+    return !stream_error_;
 }
 
 esp_err_t EpaperDisplayT42::SpiWrite(const uint8_t* data, size_t len) {
@@ -339,7 +381,7 @@ bool EpaperDisplayT42::WaitBusy(const char* reason, uint32_t timeout_ms) {
     const TickType_t start = xTaskGetTickCount();
     const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
 
-    // UC8179 / common Waveshare 7.5" HAT wiring: BUSY is active LOW.
+    // UC8179 / Waveshare 7.5" HAT BUSY is active LOW in this verified setup.
     while (gpio_get_level(EPD_BUSY_PIN) == 0) {
         if ((xTaskGetTickCount() - start) > timeout_ticks) {
             ESP_LOGE(TAG, "BUSY timeout while %s", reason);
@@ -354,9 +396,6 @@ bool EpaperDisplayT42::InitPanelFullRefresh() {
     PowerRail(true);
     HardwareReset();
 
-    // T42 is an 800x480 monochrome panel using UC8179. This first firmware
-    // uses a conservative full-refresh sequence. Fast/partial LUT tuning is
-    // intentionally deferred until the exact panel/HAT combination is proven.
     SendCommand(0x00); // PANEL SETTING
     SendData(0x1F);
 
@@ -397,31 +436,9 @@ bool EpaperDisplayT42::InitPanelFullRefresh() {
 }
 
 bool EpaperDisplayT42::RefreshPanelFull() {
-    if (framebuffer_ == nullptr) {
-        return false;
-    }
-
-    ESP_LOGI(TAG, "Full refresh begin");
+    ESP_LOGI(TAG, "Full refresh begin (low-memory streaming)");
 
     if (!InitPanelFullRefresh()) {
-        SleepAndPowerOff();
-        return false;
-    }
-
-    // Current image RAM.
-    SendCommand(0x13);
-    if (xSemaphoreTake(framebuffer_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Could not lock framebuffer for transfer");
-        SleepAndPowerOff();
-        return false;
-    }
-
-    gpio_set_level(EPD_DC_PIN, 1);
-    const esp_err_t tx_err = SpiWrite(framebuffer_, FRAME_BYTES);
-    xSemaphoreGive(framebuffer_mutex_);
-
-    if (tx_err != ESP_OK) {
-        ESP_LOGE(TAG, "Framebuffer SPI transfer failed: %s", esp_err_to_name(tx_err));
         SleepAndPowerOff();
         return false;
     }
@@ -429,11 +446,20 @@ bool EpaperDisplayT42::RefreshPanelFull() {
     // Initialize previous-image RAM to white on the first update.
     if (first_refresh_) {
         SendCommand(0x10);
-        SendRepeated(0xFF, FRAME_BYTES);
+        SendRepeated(0xFF, static_cast<size_t>(EPD_WIDTH) * EPD_HEIGHT / 8);
         first_refresh_ = false;
     }
 
-    // Internal temperature sensing, conservative full refresh.
+    // Select current-image RAM, then ask LVGL to render the entire UI. The
+    // flush callback streams each 800px strip directly to the controller.
+    SendCommand(0x13);
+    if (!StreamCurrentUiToPanel()) {
+        ESP_LOGE(TAG, "LVGL-to-e-paper streaming failed");
+        SleepAndPowerOff();
+        return false;
+    }
+
+    // Use UC8179's internal temperature sensor for a conservative full update.
     SendCommand(0xE0);
     SendData(0x00);
     SendCommand(0x41);
