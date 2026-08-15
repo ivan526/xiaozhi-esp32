@@ -19,6 +19,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Apply T42 display pipeline fix
+        shell: bash
+        run: |
+          git apply --check .github/patches/t42-pipeline-fix.patch
+          git apply .github/patches/t42-pipeline-fix.patch
+
       - name: Build T42 firmware
         shell: bash
         run: |
