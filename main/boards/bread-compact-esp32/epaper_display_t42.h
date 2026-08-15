@@ -6,7 +6,6 @@
 
 #include <driver/spi_master.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <lvgl.h>
 
@@ -18,18 +17,22 @@ public:
     bool IsReady() const { return ready_; }
 
 private:
-    static constexpr size_t FRAME_BYTES = EPD_WIDTH * EPD_HEIGHT / 8;
-    static constexpr int LVGL_BUFFER_ROWS = 8;
+    // Keep only a tiny LVGL strip buffer. The previous implementation kept an
+    // additional 800x480x1bpp framebuffer (48,000 bytes) in internal SRAM,
+    // which left too little contiguous heap for Xiaozhi's Opus decoder.
+    static constexpr int LVGL_BUFFER_ROWS = 4;
+    static constexpr size_t MONO_LINE_BYTES = EPD_WIDTH / 8;
 
     spi_device_handle_t spi_ = nullptr;
-    uint8_t* framebuffer_ = nullptr;
     uint8_t* lvgl_buffer_ = nullptr;
-    SemaphoreHandle_t framebuffer_mutex_ = nullptr;
+    uint8_t* mono_line_ = nullptr;
     TaskHandle_t refresh_task_handle_ = nullptr;
 
     bool ready_ = false;
     bool first_refresh_ = true;
     bool power_rail_on_ = false;
+    volatile bool streaming_refresh_ = false;
+    volatile bool stream_error_ = false;
 
     static void LvglFlushCb(lv_display_t* disp, const lv_area_t* area, uint8_t* color_p);
     static void RefreshTaskEntry(void* arg);
@@ -37,9 +40,8 @@ private:
 
     bool InitializeHardware();
     bool InitializeLvgl();
-
-    void SetPixel(int x, int y, bool black);
     void NotifyRefresh();
+    bool StreamCurrentUiToPanel();
 
     esp_err_t SpiWrite(const uint8_t* data, size_t len);
     void SendCommand(uint8_t cmd);
