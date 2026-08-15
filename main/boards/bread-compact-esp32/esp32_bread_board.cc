@@ -4,11 +4,56 @@
 #include "button.h"
 #include "config.h"
 #include "epaper_display_t42.h"
+#include "lvgl_theme.h"
 
 #include <esp_log.h>
 #include <driver/gpio.h>
 
 #define TAG "BreadESP32-EpaperT42"
+
+// EpaperDisplayT42 intentionally builds a much smaller LVGL object tree than
+// LcdDisplay::SetupUI(). Assets::Apply() can replace the text font at runtime;
+// LvglDisplay::SetTextFont() then dispatches SetTheme() virtually. Calling the
+// stock LcdDisplay::SetTheme() here would touch LCD-only objects (mute_label_,
+// battery_label_, content_, etc.) that do not exist on the compact e-paper UI.
+// Keep theme/font rebinding local to the objects that actually exist.
+class SafeEpaperDisplayT42 : public EpaperDisplayT42 {
+public:
+    void SetTheme(Theme* theme) override {
+        if (theme == nullptr) {
+            return;
+        }
+
+        auto* lvgl_theme = static_cast<LvglTheme*>(theme);
+        auto font_owner = lvgl_theme->text_font();
+        const lv_font_t* text_font =
+            (font_owner != nullptr) ? font_owner->font() : nullptr;
+
+        {
+            DisplayLockGuard lock(this);
+            lv_obj_t* screen =
+                (display_ != nullptr) ? lv_display_get_screen_active(display_) : nullptr;
+
+            if (screen != nullptr && text_font != nullptr) {
+                // The compact T42 UI keeps all of its labels/dividers as direct
+                // children of the active screen. Rebind the screen and each child
+                // to the newly downloaded font, without touching LCD-only widgets.
+                lv_obj_set_style_text_font(screen, text_font, 0);
+                const uint32_t child_count = lv_obj_get_child_cnt(screen);
+                for (uint32_t i = 0; i < child_count; ++i) {
+                    lv_obj_t* child = lv_obj_get_child(screen, i);
+                    if (child != nullptr) {
+                        lv_obj_set_style_text_font(child, text_font, 0);
+                    }
+                }
+            }
+        }
+
+        // Preserve the normal theme bookkeeping/settings behavior without
+        // entering LcdDisplay::SetTheme().
+        Display::SetTheme(theme);
+    }
+};
 
 class CompactWifiBoard : public WifiBoard {
 private:
@@ -53,7 +98,7 @@ private:
     }
 
     void InitializeDisplay() {
-        auto* epaper = new EpaperDisplayT42();
+        auto* epaper = new SafeEpaperDisplayT42();
         if (epaper->IsReady()) {
             display_ = epaper;
             ESP_LOGI(TAG, "T42 e-paper display initialized");

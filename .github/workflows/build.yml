@@ -25,24 +25,9 @@ jobs:
           source $IDF_PATH/export.sh
           python scripts/build.py bread-compact-esp32 --name bread-compact-esp32-epaper-t42
 
-      - name: Symbolicate reported crash
-        shell: bash
-        run: |
-          source $IDF_PATH/export.sh
-          ELF=$(find build -maxdepth 1 -name '*.elf' | head -n 1)
-          echo "ELF=$ELF"
-          xtensa-esp32-elf-addr2line -pfiaC -e "$ELF" \
-            0x4013bdc7 0x4013c47a 0x400e0f86 0x400e179a \
-            0x400f0452 0x4021e4ae 0x400ebd18 0x400ed18a 0x400ed1c2 \
-            | tee build/crash-symbols.txt
-
-      - name: Upload firmware and debug symbols
+      - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
           name: xiaozhi_bread-compact-esp32-epaper-t42_${{ github.sha }}
-          path: |
-            build/merged-binary.bin
-            build/*.elf
-            build/*.map
-            build/crash-symbols.txt
+          path: build/merged-binary.bin
           if-no-files-found: error
