@@ -19,10 +19,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply Run21 proven diagnostic HW-SPI fix
+      - name: Apply proven diagnostic HW-SPI transport
         shell: bash
         run: |
           python .github/t42_patch_run21.py
+
+      - name: Apply pre-WiFi warm-panel fix
+        shell: bash
+        run: |
+          python .github/t42_patch_run23.py
 
       - name: Build T42 firmware
         shell: bash
