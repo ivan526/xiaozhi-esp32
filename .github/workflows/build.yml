@@ -34,6 +34,12 @@ jobs:
               "    int stream_rows_ = 0;\n"
               "    int stream_flushes_ = 0;\n"
               "    int stream_next_y_ = 0;\n", 1)
+
+          anchor = "    bool WaitBusyRelease(const char* reason, uint32_t timeout_ms);\n"
+          assert anchor in h
+          h = h.replace(anchor,
+              "    bool WaitBusyCycle(const char* reason, uint32_t assert_timeout_ms, uint32_t release_timeout_ms);\n" +
+              anchor, 1)
           hp.write_text(h)
 
           sp = Path('main/boards/bread-compact-esp32/epaper_display_t42.cc')
@@ -131,6 +137,54 @@ jobs:
           s, n = re.subn(pattern, new_func, s, count=1, flags=re.S)
           assert n == 1, 'StreamCurrentUiToPanel replacement failed'
 
+          busy_cycle_func = r'''bool EpaperDisplayT42::WaitBusyCycle(
+              const char* reason,
+              uint32_t assert_timeout_ms,
+              uint32_t release_timeout_ms) {
+              TickType_t start = xTaskGetTickCount();
+              ESP_LOGI(TAG, "%s: waiting BUSY LOW, current=%d",
+                       reason, gpio_get_level(EPD_BUSY_PIN));
+
+              while (gpio_get_level(EPD_BUSY_PIN) != 0) {
+                  if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(assert_timeout_ms)) {
+                      ESP_LOGE(TAG,
+                               "%s: BUSY never asserted LOW within %u ms (level=%d)",
+                               reason,
+                               static_cast<unsigned>(assert_timeout_ms),
+                               gpio_get_level(EPD_BUSY_PIN));
+                      return false;
+                  }
+                  vTaskDelay(pdMS_TO_TICKS(5));
+              }
+
+              const uint32_t assert_elapsed =
+                  static_cast<uint32_t>((xTaskGetTickCount() - start) * portTICK_PERIOD_MS);
+              ESP_LOGI(TAG, "%s: BUSY LOW after %u ms; waiting release HIGH",
+                       reason, static_cast<unsigned>(assert_elapsed));
+
+              start = xTaskGetTickCount();
+              while (gpio_get_level(EPD_BUSY_PIN) == 0) {
+                  if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(release_timeout_ms)) {
+                      ESP_LOGE(TAG, "%s: BUSY stayed LOW > %u ms",
+                               reason, static_cast<unsigned>(release_timeout_ms));
+                      return false;
+                  }
+                  vTaskDelay(pdMS_TO_TICKS(5));
+              }
+
+              const uint32_t busy_elapsed =
+                  static_cast<uint32_t>((xTaskGetTickCount() - start) * portTICK_PERIOD_MS);
+              ESP_LOGI(TAG, "%s: BUSY released HIGH after %u ms",
+                       reason, static_cast<unsigned>(busy_elapsed));
+              return true;
+          }
+
+          '''
+          busy_cycle_func = re.sub(r'^          ', '', busy_cycle_func, flags=re.M)
+          anchor = "bool EpaperDisplayT42::WaitBusyRelease(const char* reason, uint32_t timeout_ms) {\n"
+          assert anchor in s
+          s = s.replace(anchor, busy_cycle_func + anchor, 1)
+
           old = (
               "    SendCommand(0x50); // VCOM / DATA INTERVAL\n"
               "    SendData(0x10);\n"
@@ -146,9 +200,34 @@ jobs:
           )
           assert old in s
           s = s.replace(old, new, 1)
-          sp.write_text(s)
 
-          print('T42 pipeline rewrite applied successfully')
+          old = '    if (!WaitBusyRelease("power-on", 5000)) {\n'
+          new = '    if (!WaitBusyRelease("power-on", EPD_BUSY_TIMEOUT_MS)) {\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '    const bool ok = WaitBusyRelease("display-refresh", EPD_BUSY_TIMEOUT_MS);\n\n    SleepAndPowerOff();\n'
+          new = (
+              '    const bool ok = WaitBusyCycle("display-refresh", 1500, EPD_BUSY_TIMEOUT_MS);\n\n'
+              '    if (!ok) {\n'
+              '        ESP_LOGE(TAG, "DISPLAY REFRESH BUSY cycle failed; hard power reset");\n'
+              '        PowerRail(false);\n'
+              '        vTaskDelay(pdMS_TO_TICKS(300));\n'
+              '        ESP_LOGI(TAG, "Full refresh failed");\n'
+              '        return false;\n'
+              '    }\n\n'
+              '    SleepAndPowerOff();\n'
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '    WaitBusyRelease("power-off", 2000);\n'
+          new = '    WaitBusyRelease("power-off", EPD_BUSY_TIMEOUT_MS);\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          sp.write_text(s)
+          print('T42 pipeline + BUSY-cycle rewrite applied successfully')
           PY
 
       - name: Build T42 firmware
