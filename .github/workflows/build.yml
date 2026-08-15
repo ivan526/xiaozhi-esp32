@@ -19,7 +19,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply Waveshare ESP32 7.5 V2 compatibility driver
+      - name: Apply exact Waveshare ESP32 7.5 V2 sample path
         shell: bash
         run: |
           python - <<'PY'
@@ -36,19 +36,65 @@ jobs:
               "    int stream_next_y_ = 0;\n", 1)
           hp.write_text(h)
 
-          cp = Path('main/boards/bread-compact-esp32/config.h')
-          c = cp.read_text()
-          old_clock = '#define EPD_SPI_CLOCK_HZ        (4 * 1000 * 1000)\n'
-          assert old_clock in c
-          c = c.replace(old_clock,
-                        '#define EPD_SPI_CLOCK_HZ        (2 * 1000 * 1000)\n', 1)
-          cp.write_text(c)
-
           sp = Path('main/boards/bread-compact-esp32/epaper_display_t42.cc')
           s = sp.read_text()
-          old_chunk = 'constexpr size_t kSpiChunk = 4096;\n'
-          assert old_chunk in s
-          s = s.replace(old_chunk, 'constexpr size_t kSpiChunk = 256;\n', 1)
+
+          old = 'constexpr size_t kSpiChunk = 4096;\n'
+          assert old in s
+          s = s.replace(old, 'constexpr uint32_t kSpiHalfPeriodUs = 1;\n', 1)
+
+          new_hw = r'''bool EpaperDisplayT42::InitializeHardware() {
+              gpio_config_t out_cfg = {};
+              out_cfg.pin_bit_mask =
+                  (1ULL << EPD_PWR_PIN) |
+                  (1ULL << EPD_RST_PIN) |
+                  (1ULL << EPD_DC_PIN) |
+                  (1ULL << EPD_CS_PIN) |
+                  (1ULL << EPD_SCLK_PIN) |
+                  (1ULL << EPD_MOSI_PIN);
+              out_cfg.mode = GPIO_MODE_OUTPUT;
+              out_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+              out_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+              out_cfg.intr_type = GPIO_INTR_DISABLE;
+              if (gpio_config(&out_cfg) != ESP_OK) {
+                  return false;
+              }
+
+              gpio_config_t busy_cfg = {};
+              busy_cfg.pin_bit_mask = (1ULL << EPD_BUSY_PIN);
+              busy_cfg.mode = GPIO_MODE_INPUT;
+              busy_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+              busy_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+              busy_cfg.intr_type = GPIO_INTR_DISABLE;
+              if (gpio_config(&busy_cfg) != ESP_OK) {
+                  return false;
+              }
+
+              gpio_set_level(EPD_CS_PIN, 1);
+              gpio_set_level(EPD_SCLK_PIN, 0);
+              gpio_set_level(EPD_MOSI_PIN, 0);
+              gpio_set_level(EPD_RST_PIN, 1);
+              gpio_set_level(EPD_DC_PIN, 1);
+
+              gpio_set_level(EPD_PWR_PIN, 1);
+              power_rail_on_ = true;
+              vTaskDelay(pdMS_TO_TICKS(100));
+
+              mono_line_ = static_cast<uint8_t*>(
+                  heap_caps_malloc(MONO_LINE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+              if (mono_line_ == nullptr) {
+                  ESP_LOGE(TAG, "Failed to allocate monochrome line buffer");
+                  return false;
+              }
+
+              ESP_LOGI(TAG, "Hardware ready: Waveshare-compatible bit-bang SPI, PWR held HIGH");
+              return true;
+          }'''
+          new_hw = re.sub(r'^          ', '', new_hw, flags=re.M)
+          pattern = (r'bool EpaperDisplayT42::InitializeHardware\(\) \{.*?\n\}'
+                     r'(?=\n\nbool EpaperDisplayT42::InitializeLvgl)')
+          s, n = re.subn(pattern, new_hw, s, count=1, flags=re.S)
+          assert n == 1
 
           anchor = "        area->x1 != 0 || area->x2 != (EPD_WIDTH - 1)) {\n"
           assert anchor in s
@@ -142,8 +188,33 @@ jobs:
           s, n = re.subn(pattern, new_stream, s, count=1, flags=re.S)
           assert n == 1
 
-          old_reset = r'''void EpaperDisplayT42::HardwareReset() {
-              // Verified with the working diagnostic build / Waveshare Rev2.3 timing.
+          new_spi = r'''esp_err_t EpaperDisplayT42::SpiWrite(const uint8_t* data, size_t len) {
+              if (data == nullptr || len == 0) {
+                  return ESP_ERR_INVALID_ARG;
+              }
+
+              for (size_t i = 0; i < len; ++i) {
+                  uint8_t value = data[i];
+                  gpio_set_level(EPD_CS_PIN, 0);
+                  for (int bit = 0; bit < 8; ++bit) {
+                      gpio_set_level(EPD_MOSI_PIN, (value & 0x80) ? 1 : 0);
+                      value <<= 1;
+                      gpio_set_level(EPD_SCLK_PIN, 1);
+                      esp_rom_delay_us(kSpiHalfPeriodUs);
+                      gpio_set_level(EPD_SCLK_PIN, 0);
+                      esp_rom_delay_us(kSpiHalfPeriodUs);
+                  }
+                  gpio_set_level(EPD_CS_PIN, 1);
+              }
+              return ESP_OK;
+          }'''
+          new_spi = re.sub(r'^          ', '', new_spi, flags=re.M)
+          pattern = (r'esp_err_t EpaperDisplayT42::SpiWrite\(const uint8_t\* data, size_t len\) \{.*?\n\}'
+                     r'(?=\n\nvoid EpaperDisplayT42::SendCommand)')
+          s, n = re.subn(pattern, new_spi, s, count=1, flags=re.S)
+          assert n == 1
+
+          new_reset = r'''void EpaperDisplayT42::HardwareReset() {
               gpio_set_level(EPD_RST_PIN, 1);
               vTaskDelay(pdMS_TO_TICKS(20));
               gpio_set_level(EPD_RST_PIN, 0);
@@ -151,43 +222,32 @@ jobs:
               gpio_set_level(EPD_RST_PIN, 1);
               vTaskDelay(pdMS_TO_TICKS(20));
           }'''
-          new_reset = r'''void EpaperDisplayT42::HardwareReset() {
-              gpio_set_level(EPD_RST_PIN, 1);
-              vTaskDelay(pdMS_TO_TICKS(20));
-              gpio_set_level(EPD_RST_PIN, 0);
-              vTaskDelay(pdMS_TO_TICKS(4));
-              gpio_set_level(EPD_RST_PIN, 1);
-              vTaskDelay(pdMS_TO_TICKS(20));
-          }'''
-          old_reset = re.sub(r'^          ', '', old_reset, flags=re.M)
           new_reset = re.sub(r'^          ', '', new_reset, flags=re.M)
-          assert old_reset in s
-          s = s.replace(old_reset, new_reset, 1)
+          pattern = (r'void EpaperDisplayT42::HardwareReset\(\) \{.*?\n\}'
+                     r'(?=\n\nbool EpaperDisplayT42::WaitBusyRelease)')
+          s, n = re.subn(pattern, new_reset, s, count=1, flags=re.S)
+          assert n == 1
 
           new_wait = r'''bool EpaperDisplayT42::WaitBusyRelease(const char* reason, uint32_t timeout_ms) {
               const TickType_t start = xTaskGetTickCount();
               ESP_LOGI(TAG, "%s: BUSY wait start level=%d",
                        reason, gpio_get_level(EPD_BUSY_PIN));
 
-              while (true) {
-                  SendCommand(0x71);
-                  vTaskDelay(pdMS_TO_TICKS(10));
-                  const int level = gpio_get_level(EPD_BUSY_PIN);
-                  if (level != 0) {
+              do {
+                  vTaskDelay(pdMS_TO_TICKS(5));
+                  if (gpio_get_level(EPD_BUSY_PIN) != 0) {
                       const uint32_t elapsed =
                           static_cast<uint32_t>((xTaskGetTickCount() - start) * portTICK_PERIOD_MS);
+                      vTaskDelay(pdMS_TO_TICKS(5));
                       ESP_LOGI(TAG, "%s: BUSY released HIGH after %u ms",
                                reason, static_cast<unsigned>(elapsed));
-                      vTaskDelay(pdMS_TO_TICKS(20));
                       return true;
                   }
+              } while ((xTaskGetTickCount() - start) <= pdMS_TO_TICKS(timeout_ms));
 
-                  if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(timeout_ms)) {
-                      ESP_LOGW(TAG, "%s: BUSY did not release within %u ms (level=%d)",
-                               reason, static_cast<unsigned>(timeout_ms), level);
-                      return false;
-                  }
-              }
+              ESP_LOGW(TAG, "%s: BUSY still LOW after %u ms; using timed fallback",
+                       reason, static_cast<unsigned>(timeout_ms));
+              return false;
           }'''
           new_wait = re.sub(r'^          ', '', new_wait, flags=re.M)
           pattern = (r'bool EpaperDisplayT42::WaitBusyRelease\(const char\* reason, uint32_t timeout_ms\) \{.*?\n\}'
@@ -203,65 +263,26 @@ jobs:
               HardwareReset();
               ESP_LOGI(TAG, "After reset BUSY=%d", gpio_get_level(EPD_BUSY_PIN));
 
-              static constexpr uint8_t lut_vcom[42] = {
-                  0x00,0x0F,0x0F,0x00,0x00,0x01,
-                  0x00,0x0F,0x01,0x0F,0x01,0x02,
-                  0x00,0x0F,0x0F,0x00,0x00,0x01,
-                  0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0
-              };
-              static constexpr uint8_t lut_ww[42] = {
-                  0x10,0x0F,0x0F,0x00,0x00,0x01,
-                  0x84,0x0F,0x01,0x0F,0x01,0x02,
-                  0x20,0x0F,0x0F,0x00,0x00,0x01,
-                  0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0
-              };
-              static constexpr uint8_t lut_bw[42] = {
-                  0x10,0x0F,0x0F,0x00,0x00,0x01,
-                  0x84,0x0F,0x01,0x0F,0x01,0x02,
-                  0x20,0x0F,0x0F,0x00,0x00,0x01,
-                  0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0
-              };
-              static constexpr uint8_t lut_wb[42] = {
-                  0x80,0x0F,0x0F,0x00,0x00,0x01,
-                  0x84,0x0F,0x01,0x0F,0x01,0x02,
-                  0x40,0x0F,0x0F,0x00,0x00,0x01,
-                  0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0
-              };
-              static constexpr uint8_t lut_bb[42] = {
-                  0x80,0x0F,0x0F,0x00,0x00,0x01,
-                  0x84,0x0F,0x01,0x0F,0x01,0x02,
-                  0x40,0x0F,0x0F,0x00,0x00,0x01,
-                  0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0
-              };
-
               SendCommand(0x01);
-              SendData(0x17);
-              SendData(0x17);
+              SendData(0x07);
+              SendData(0x07);
               SendData(0x3F);
               SendData(0x3F);
-              SendData(0x11);
-
-              SendCommand(0x82);
-              SendData(0x24);
 
               SendCommand(0x06);
-              SendData(0x27);
-              SendData(0x27);
-              SendData(0x2F);
               SendData(0x17);
-
-              SendCommand(0x30);
-              SendData(0x06);
+              SendData(0x17);
+              SendData(0x28);
+              SendData(0x17);
 
               SendCommand(0x04);
               vTaskDelay(pdMS_TO_TICKS(100));
               if (!WaitBusyRelease("power-on", 3000)) {
-                  ESP_LOGW(TAG, "power-on BUSY unavailable; continuing after fixed delay");
                   vTaskDelay(pdMS_TO_TICKS(1000));
               }
 
               SendCommand(0x00);
-              SendData(0x3F);
+              SendData(0x1F);
 
               SendCommand(0x61);
               SendData(0x03);
@@ -274,28 +295,10 @@ jobs:
 
               SendCommand(0x50);
               SendData(0x10);
-              SendData(0x00);
+              SendData(0x07);
 
               SendCommand(0x60);
               SendData(0x22);
-
-              SendCommand(0x65);
-              SendData(0x00);
-              SendData(0x00);
-              SendData(0x00);
-              SendData(0x00);
-
-              auto load_lut = [this](uint8_t cmd, const uint8_t* lut) {
-                  SendCommand(cmd);
-                  gpio_set_level(EPD_DC_PIN, 1);
-                  ESP_ERROR_CHECK_WITHOUT_ABORT(SpiWrite(lut, 42));
-              };
-              load_lut(0x20, lut_vcom);
-              load_lut(0x21, lut_ww);
-              load_lut(0x22, lut_bw);
-              load_lut(0x23, lut_wb);
-              load_lut(0x24, lut_bb);
-
               return true;
           }'''
           new_init = re.sub(r'^          ', '', new_init, flags=re.M)
@@ -305,15 +308,21 @@ jobs:
           assert n == 1
 
           new_refresh = r'''bool EpaperDisplayT42::RefreshPanelFull() {
-              ESP_LOGI(TAG, "Full refresh begin (Waveshare ESP32 7.5 V2 path)");
+              ESP_LOGI(TAG, "Full refresh begin (exact Waveshare ESP32 V3 path)");
 
               if (!InitPanelFullRefresh()) {
                   return false;
               }
 
+              SendCommand(0x10);
+              if (!StreamCurrentUiToPanel(false)) {
+                  ESP_LOGE(TAG, "LVGL plane 0x10 streaming failed");
+                  return false;
+              }
+
               SendCommand(0x13);
               if (!StreamCurrentUiToPanel(true)) {
-                  ESP_LOGE(TAG, "LVGL 0x13 stream failed");
+                  ESP_LOGE(TAG, "LVGL plane 0x13 streaming failed");
                   return false;
               }
 
@@ -321,11 +330,9 @@ jobs:
               vTaskDelay(pdMS_TO_TICKS(100));
               const bool busy_ok = WaitBusyRelease("display-refresh", 8000);
               if (!busy_ok) {
-                  ESP_LOGW(TAG, "display-refresh BUSY unavailable; using 2s safety tail");
-                  vTaskDelay(pdMS_TO_TICKS(2000));
+                  vTaskDelay(pdMS_TO_TICKS(3000));
               }
 
-              SleepAndPowerOff();
               ESP_LOGI(TAG, "Full refresh done (%s)",
                        busy_ok ? "BUSY confirmed" : "timed fallback");
               return true;
@@ -337,18 +344,18 @@ jobs:
           assert n == 1
 
           new_sleep = r'''void EpaperDisplayT42::SleepAndPowerOff() {
-              if (spi_ == nullptr || !power_rail_on_) {
+              if (!power_rail_on_) {
                   return;
               }
 
+              SendCommand(0x50);
+              SendData(0xF7);
               SendCommand(0x02);
               vTaskDelay(pdMS_TO_TICKS(100));
-              if (!WaitBusyRelease("power-off", 2000)) {
-                  ESP_LOGW(TAG, "power-off BUSY unavailable; continuing to deep sleep");
-                  vTaskDelay(pdMS_TO_TICKS(500));
-              }
+              WaitBusyRelease("power-off", 2000);
               SendCommand(0x07);
               SendData(0xA5);
+              PowerRail(false);
           }'''
           new_sleep = re.sub(r'^          ', '', new_sleep, flags=re.M)
           pattern = r'void EpaperDisplayT42::SleepAndPowerOff\(\) \{.*?\n\}'
@@ -356,7 +363,7 @@ jobs:
           assert n == 1
 
           sp.write_text(s)
-          print('Applied Waveshare ESP32 epd7in5_V2 compatibility path')
+          print('Applied exact uploaded Waveshare ESP32 V3 driver behavior')
           PY
 
       - name: Build T42 firmware
