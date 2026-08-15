@@ -19,10 +19,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply Run19 Waveshare row-framing fix
+      - name: Apply Run21 proven diagnostic HW-SPI fix
         shell: bash
         run: |
-          python .github/t42_patch_run19.py
+          python .github/t42_patch_run21.py
 
       - name: Build T42 firmware
         shell: bash
