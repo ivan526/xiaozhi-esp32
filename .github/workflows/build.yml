@@ -22,7 +22,9 @@ jobs:
       - name: Restore proven one-shot diagnostic transport
         shell: bash
         run: |
-          git checkout ecb417474d96298c0e0370f38b8b3c8ddad8e8e5 -- main/boards/bread-compact-esp32/esp32_bread_board.cc
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --no-tags --depth=1 origin ecb417474d96298c0e0370f38b8b3c8ddad8e8e5
+          git checkout FETCH_HEAD -- main/boards/bread-compact-esp32/esp32_bread_board.cc
           python - <<'PY'
           from pathlib import Path
           p = Path('main/boards/bread-compact-esp32/esp32_bread_board.cc')
