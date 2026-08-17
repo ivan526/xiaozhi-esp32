@@ -9,12 +9,13 @@
 #include <freertos/task.h>
 #include <lvgl.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 
-// Kept under the historical EpaperDisplayT42 class/file name so this remains a
-// board-local change. The low-level driver now targets GDEY075T7 / UC8179.
+// Board-local GDEY075T7 / UC8179 driver for bread-compact-esp32.
+// It keeps the historical T42 class/file name to minimize changes outside this board.
 class EpaperDisplayT42 : public LcdDisplay {
 public:
     EpaperDisplayT42();
@@ -33,22 +34,36 @@ public:
     void SetPowerSaveMode(bool on) override;
 
 private:
-    // 800 x 4 rows x RGB565 = 6,400 bytes. Keep the display footprint small so
-    // the classic ESP32 still has enough contiguous SRAM for Opus/audio.
     static constexpr int LVGL_BUFFER_ROWS = 4;
     static constexpr size_t MONO_LINE_BYTES = EPD_WIDTH / 8;
+
+    enum RefreshMask : uint32_t {
+        REFRESH_NONE      = 0,
+        REFRESH_STATUS    = 1u << 0,
+        REFRESH_USER      = 1u << 1,
+        REFRESH_ASSISTANT = 1u << 2,
+        REFRESH_FULL      = 1u << 31,
+    };
 
     spi_device_handle_t spi_ = nullptr;
     uint8_t* lvgl_buffer_ = nullptr;
     uint8_t* mono_line_ = nullptr;
+    uint8_t* partial_buffer_ = nullptr;
+    size_t partial_buffer_size_ = 0;
     TaskHandle_t refresh_task_handle_ = nullptr;
 
     bool ready_ = false;
     bool panel_powered_ = false;
+    bool full_refresh_done_ = false;
+    uint32_t partial_refresh_count_ = 0;
+
     volatile bool speaking_ = false;
     volatile bool streaming_refresh_ = false;
-    volatile bool stream_invert_ = false;
+    volatile bool capture_partial_ = false;
     volatile bool stream_error_ = false;
+    lv_area_t capture_area_ = {0, 0, 0, 0};
+
+    std::atomic<uint32_t> pending_refresh_mask_{REFRESH_NONE};
 
     lv_obj_t* title_label_ = nullptr;
     lv_obj_t* user_label_ = nullptr;
@@ -64,9 +79,13 @@ private:
 
     bool InitializeHardware();
     bool InitializeLvgl();
-    void NotifyRefresh();
-    bool StreamCurrentUiToPanel(bool invert);
+    void NotifyRefresh(uint32_t mask);
+
+    bool StreamCurrentUiToPanel();
     bool StreamSolidPlane(uint8_t value);
+    bool CaptureUiRegion(int y_start, int y_end);
+    bool WriteCapturedPartialRegion(int y_start, int y_end);
+    void ReleasePartialBuffer();
 
     void UpdateUserLabelLocked();
     void UpdateAssistantLabelLocked();
@@ -78,8 +97,13 @@ private:
 
     void HardwareReset();
     bool WaitBusyRelease(const char* reason, uint32_t timeout_ms);
+    void ConfigurePanelBase();
     bool InitPanelFullRefresh();
+    bool InitPanelPartialRefresh();
+    bool SetPartialWindow(int x_start, int y_start, int x_end, int y_end);
     bool RefreshPanelFull();
+    bool RefreshPanelPartial(uint32_t mask);
+    bool RefreshPartialRegion(int y_start, int y_end, const char* name);
     void SleepPanel();
 };
 
