@@ -37,9 +37,6 @@ private:
     // Classic ESP32 has tight internal SRAM and the Opus decoder is created
     // after display SetupUI(). Keep only a single RGB565 scanline here so the
     // display does not starve esp_opus_dec_open() of contiguous internal heap.
-    // E-paper refresh latency is dominated by the panel waveform, so reducing
-    // this from 4 rows to 1 has negligible visible impact while returning
-    // roughly 4.8 KB of internal RAM to the audio stack.
     static constexpr int LVGL_BUFFER_ROWS = 1;
     static constexpr size_t MONO_LINE_BYTES = EPD_WIDTH / 8;
 
@@ -97,6 +94,7 @@ private:
     lv_obj_t* weather_title_label_ = nullptr;
     lv_obj_t* weather_current_label_ = nullptr;
     lv_obj_t* weather_aqi_label_ = nullptr;
+    std::array<lv_obj_t*, 4> weather_icon_labels_{};
     std::array<lv_obj_t*, 3> weather_forecast_labels_{};
     std::array<lv_obj_t*, 3> todo_labels_{};
     std::array<lv_obj_t*, 4> quick_labels_{};
@@ -128,6 +126,9 @@ private:
     lv_obj_t* CreateBox(lv_obj_t* screen, int x, int y, int w, int h);
     lv_obj_t* CreateLabel(lv_obj_t* screen, int x, int y, int w, const char* text,
                           lv_text_align_t align = LV_TEXT_ALIGN_LEFT);
+    lv_obj_t* CreateSymbolLabel(lv_obj_t* screen, int x, int y, int w, const char* symbol,
+                                lv_text_align_t align = LV_TEXT_ALIGN_LEFT);
+    lv_obj_t* CreateWeatherBadge(lv_obj_t* screen, int x, int y, int size, const char* glyph);
     void CreateSevenSegmentClock(lv_obj_t* screen);
     void UpdateClockLocked(bool force);
     void SetClockDigit(int index, int digit);
