@@ -10,9 +10,8 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
-#include <esp_rom_sys.h>
 
-#define TAG "EpaperT42"
+#define TAG "EpaperGDEY075T7"
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 
@@ -52,8 +51,8 @@ EpaperDisplayT42::EpaperDisplayT42()
 
     ready_ = true;
     ESP_LOGI(TAG,
-             "Ready: 800x480 T42 e-paper, PWR=%d BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
-             EPD_PWR_PIN, EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN,
+             "Ready: GDEY075T7 800x480, PWR=3V3(always-on) BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
+             EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN,
              EPD_CS_PIN, EPD_SCLK_PIN, EPD_MOSI_PIN);
     ESP_LOGI(TAG, "Heap after e-paper: free=%u largest=%u",
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
@@ -66,7 +65,7 @@ EpaperDisplayT42::~EpaperDisplayT42() {
         refresh_task_handle_ = nullptr;
     }
 
-    SleepAndPowerOff();
+    SleepPanel();
 
     if (spi_ != nullptr) {
         spi_bus_remove_device(spi_);
@@ -88,7 +87,6 @@ EpaperDisplayT42::~EpaperDisplayT42() {
 bool EpaperDisplayT42::InitializeHardware() {
     gpio_config_t out_cfg = {};
     out_cfg.pin_bit_mask =
-        (1ULL << EPD_PWR_PIN) |
         (1ULL << EPD_RST_PIN) |
         (1ULL << EPD_DC_PIN);
     out_cfg.mode = GPIO_MODE_OUTPUT;
@@ -102,7 +100,6 @@ bool EpaperDisplayT42::InitializeHardware() {
     gpio_config_t busy_cfg = {};
     busy_cfg.pin_bit_mask = (1ULL << EPD_BUSY_PIN);
     busy_cfg.mode = GPIO_MODE_INPUT;
-    // GPIO34 has no internal pull resistor on classic ESP32. The HAT drives BUSY.
     busy_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     busy_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     busy_cfg.intr_type = GPIO_INTR_DISABLE;
@@ -110,7 +107,6 @@ bool EpaperDisplayT42::InitializeHardware() {
         return false;
     }
 
-    gpio_set_level(EPD_PWR_PIN, 0);
     gpio_set_level(EPD_RST_PIN, 1);
     gpio_set_level(EPD_DC_PIN, 1);
 
@@ -324,9 +320,8 @@ void EpaperDisplayT42::SetStatus(const char* status) {
         lv_label_set_text(status_label_, status_text_.c_str());
     }
 
-    // During TTS playback we intentionally do not full-refresh. Assistant
-    // sentence_start events accumulate in RAM; when speaking ends the next
-    // status change triggers one final e-paper update with the complete answer.
+    // Avoid repeated full refreshes while TTS is streaming. The accumulated
+    // assistant text is rendered once the speaking state ends.
     if (!is_speaking) {
         NotifyRefresh();
     }
@@ -399,8 +394,7 @@ void EpaperDisplayT42::SetChatMessage(const char* role, const char* content) {
 }
 
 void EpaperDisplayT42::ClearChatMessages() {
-    // Preserve the last Q&A on an e-paper screen. A new user utterance replaces
-    // it naturally, so idle-state transitions do not erase useful content.
+    // Preserve the last Q&A on e-paper. A new user utterance replaces it.
     ESP_LOGI(TAG, "Preserve last Q&A on ClearChatMessages");
 }
 
@@ -411,7 +405,8 @@ void EpaperDisplayT42::UpdateStatusBar(bool update_all) {
 
 void EpaperDisplayT42::SetPowerSaveMode(bool on) {
     (void)on;
-    // Panel power is controlled per refresh via EPD_PWR_PIN.
+    // HAT PWR is hard-wired to 3V3. The UC8179 is powered down after each
+    // physical refresh via command 0x02 while the image remains on the panel.
 }
 
 void EpaperDisplayT42::LvglFlushCb(
@@ -424,7 +419,7 @@ void EpaperDisplayT42::LvglFlushCb(
         return;
     }
 
-    // Normal LVGL draws only update the in-memory UI model. Physical refreshes
+    // Normal LVGL draws only update the UI model. Physical e-paper refreshes
     // are scheduled explicitly by SetStatus/SetChatMessage/SetupUI.
     if (!self->streaming_refresh_) {
         lv_display_flush_ready(disp);
@@ -532,6 +527,21 @@ bool EpaperDisplayT42::StreamCurrentUiToPanel(bool invert) {
     return !stream_error_;
 }
 
+bool EpaperDisplayT42::StreamSolidPlane(uint8_t value) {
+    if (mono_line_ == nullptr) {
+        return false;
+    }
+
+    std::memset(mono_line_, value, MONO_LINE_BYTES);
+    gpio_set_level(EPD_DC_PIN, 1);
+    for (int y = 0; y < EPD_HEIGHT; ++y) {
+        if (SpiWrite(mono_line_, MONO_LINE_BYTES) != ESP_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
 esp_err_t EpaperDisplayT42::SpiWrite(const uint8_t* data, size_t len) {
     if (spi_ == nullptr || data == nullptr || len == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -563,26 +573,20 @@ void EpaperDisplayT42::SendData(uint8_t data) {
     ESP_ERROR_CHECK_WITHOUT_ABORT(SpiWrite(&data, 1));
 }
 
-void EpaperDisplayT42::PowerRail(bool on) {
-    gpio_set_level(EPD_PWR_PIN, on ? 1 : 0);
-    power_rail_on_ = on;
-    if (on) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
-
 void EpaperDisplayT42::HardwareReset() {
-    // Verified with the working diagnostic build / Waveshare Rev2.3 timing.
+    // Match GxEPD2's normal reset path for the Waveshare Rev2.3 HAT:
+    // preset HIGH, pulse LOW for 10 ms, then return HIGH for >=10 ms.
     gpio_set_level(EPD_RST_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(EPD_RST_PIN, 0);
-    esp_rom_delay_us(2000);
+    vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(EPD_RST_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 bool EpaperDisplayT42::WaitBusyRelease(const char* reason, uint32_t timeout_ms) {
     const TickType_t start = xTaskGetTickCount();
+    // GDEY075T7 / UC8179 BUSY is active LOW.
     while (gpio_get_level(EPD_BUSY_PIN) == 0) {
         if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(timeout_ms)) {
             ESP_LOGE(TAG, "BUSY timeout while %s, level=%d",
@@ -595,16 +599,18 @@ bool EpaperDisplayT42::WaitBusyRelease(const char* reason, uint32_t timeout_ms) 
 }
 
 bool EpaperDisplayT42::InitPanelFullRefresh() {
-    PowerRail(true);
     HardwareReset();
 
-    // Sequence proven by the split-screen hardware self-test after CS wiring
-    // was corrected. This mirrors the Waveshare 7.5-inch V2 full-refresh path.
+    // GDEY075T7 / UC8179 initialization ported from GxEPD2_750_GDEY075T7.
+    SendCommand(0x00); // PANEL SETTING
+    SendData(0x1F);    // BWOTP, full-update LUT from OTP
+
     SendCommand(0x01); // POWER SETTING
-    SendData(0x07);
-    SendData(0x07);
-    SendData(0x3F);
-    SendData(0x3F);
+    SendData(0x07);    // enable internal power
+    SendData(0x07);    // VGH=20V, VGL=-20V
+    SendData(0x3F);    // VDH=15V
+    SendData(0x3F);    // VDL=-15V
+    SendData(0x09);    // VDHR=4.2V
 
     SendCommand(0x06); // BOOSTER SOFT START
     SendData(0x17);
@@ -612,74 +618,82 @@ bool EpaperDisplayT42::InitPanelFullRefresh() {
     SendData(0x28);
     SendData(0x17);
 
-    SendCommand(0x04); // POWER ON
-    vTaskDelay(pdMS_TO_TICKS(100));
-    if (!WaitBusyRelease("power-on", 5000)) {
-        return false;
-    }
-
-    SendCommand(0x00); // PANEL SETTING
-    SendData(0x1F);
-
-    SendCommand(0x61); // 800 x 480
+    SendCommand(0x61); // TRES: 800 x 480
     SendData(0x03);
     SendData(0x20);
     SendData(0x01);
     SendData(0xE0);
 
-    SendCommand(0x15);
+    SendCommand(0x15); // DUSPI
     SendData(0x00);
 
-    SendCommand(0x50); // VCOM / DATA INTERVAL
-    SendData(0x10);
+    SendCommand(0x50); // VCOM AND DATA INTERVAL SETTING
+    SendData(0x29);    // LUTKW, copy new image to old
     SendData(0x07);
 
-    SendCommand(0x60); // TCON
+    SendCommand(0x60); // TCON SETTING
     SendData(0x22);
 
+    SendCommand(0xE3); // PWS
+    SendData(0x22);
+
+    SendCommand(0x00); // full-update panel setting
+    SendData(0x1F);
+
+    SendCommand(0x04); // POWER ON
+    if (!WaitBusyRelease("power-on", EPD_BUSY_TIMEOUT_MS)) {
+        panel_powered_ = false;
+        return false;
+    }
+
+    panel_powered_ = true;
     return true;
 }
 
 bool EpaperDisplayT42::RefreshPanelFull() {
-    ESP_LOGI(TAG, "Full refresh begin (compact UI, two-plane streaming)");
+    ESP_LOGI(TAG, "Full refresh begin (GDEY075T7 current-plane streaming)");
 
     if (!InitPanelFullRefresh()) {
-        SleepAndPowerOff();
+        SleepPanel();
         return false;
     }
 
-    // Waveshare's monochrome 7.5-inch path writes the image to 0x10 and the
-    // inverse image to 0x13. Render the LVGL screen twice without a 48KB frame.
+    // GDEY075T7 uses 0x13 as the current image. Initialize the previous plane
+    // to 0x00, matching GxEPD2's initial full-screen buffer behavior.
     SendCommand(0x10);
-    if (!StreamCurrentUiToPanel(false)) {
-        ESP_LOGE(TAG, "LVGL plane 0x10 streaming failed");
-        SleepAndPowerOff();
+    if (!StreamSolidPlane(0x00)) {
+        ESP_LOGE(TAG, "Previous plane 0x10 streaming failed");
+        SleepPanel();
         return false;
     }
 
     SendCommand(0x13);
-    if (!StreamCurrentUiToPanel(true)) {
-        ESP_LOGE(TAG, "LVGL plane 0x13 streaming failed");
-        SleepAndPowerOff();
+    if (!StreamCurrentUiToPanel(false)) {
+        ESP_LOGE(TAG, "Current plane 0x13 streaming failed");
+        SleepPanel();
         return false;
     }
 
+    // Full-update sequence from GxEPD2_750_GDEY075T7::_Update_Full().
+    SendCommand(0xE0); // Cascade Setting
+    SendData(0x00);    // no forced temperature
+    SendCommand(0x41); // enable internal temperature sensor
+    SendData(0x00);
     SendCommand(0x12); // DISPLAY REFRESH
-    vTaskDelay(pdMS_TO_TICKS(100));
+
     const bool ok = WaitBusyRelease("display-refresh", EPD_BUSY_TIMEOUT_MS);
 
-    SleepAndPowerOff();
+    SleepPanel();
     ESP_LOGI(TAG, "Full refresh %s", ok ? "done" : "failed");
     return ok;
 }
 
-void EpaperDisplayT42::SleepAndPowerOff() {
-    if (spi_ == nullptr || !power_rail_on_) {
+void EpaperDisplayT42::SleepPanel() {
+    if (spi_ == nullptr || !panel_powered_) {
         return;
     }
 
     SendCommand(0x02); // POWER OFF
-    vTaskDelay(pdMS_TO_TICKS(100));
-    WaitBusyRelease("power-off", 2000);
-    PowerRail(false);
+    WaitBusyRelease("power-off", 3000);
+    panel_powered_ = false;
 }

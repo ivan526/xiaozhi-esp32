@@ -9,7 +9,7 @@
 #include <esp_log.h>
 #include <driver/gpio.h>
 
-#define TAG "BreadESP32-EpaperT42"
+#define TAG "BreadESP32-GDEY075T7"
 
 // EpaperDisplayT42 intentionally builds a much smaller LVGL object tree than
 // LcdDisplay::SetupUI(). Assets::Apply() can replace the text font at runtime;
@@ -35,9 +35,6 @@ public:
                 (display_ != nullptr) ? lv_display_get_screen_active(display_) : nullptr;
 
             if (screen != nullptr && text_font != nullptr) {
-                // The compact T42 UI keeps all of its labels/dividers as direct
-                // children of the active screen. Rebind the screen and each child
-                // to the newly downloaded font, without touching LCD-only widgets.
                 lv_obj_set_style_text_font(screen, text_font, 0);
                 const uint32_t child_count = lv_obj_get_child_cnt(screen);
                 for (uint32_t i = 0; i < child_count; ++i) {
@@ -58,7 +55,6 @@ public:
 class CompactWifiBoard : public WifiBoard {
 private:
     Button boot_button_;
-    Button touch_button_;
     Button asr_button_;
     Display* display_ = nullptr;
 
@@ -86,24 +82,18 @@ private:
             Application::GetInstance().WakeWordInvoke(wake_word);
         });
 
-        touch_button_.OnPressDown([this]() {
-            gpio_set_level(BUILTIN_LED_GPIO, 1);
-            Application::GetInstance().StartListening();
-        });
-
-        touch_button_.OnPressUp([this]() {
-            gpio_set_level(BUILTIN_LED_GPIO, 0);
-            Application::GetInstance().StopListening();
-        });
+        // The original bread-compact touch button used GPIO5. GPIO5 is now the
+        // e-paper CS pin, so the touch button is intentionally disabled for this
+        // board variant to avoid driving the display chip-select line.
     }
 
     void InitializeDisplay() {
         auto* epaper = new SafeEpaperDisplayT42();
         if (epaper->IsReady()) {
             display_ = epaper;
-            ESP_LOGI(TAG, "T42 e-paper display initialized");
+            ESP_LOGI(TAG, "GDEY075T7 e-paper display initialized");
         } else {
-            ESP_LOGE(TAG, "T42 e-paper display init failed, falling back to NoDisplay");
+            ESP_LOGE(TAG, "GDEY075T7 e-paper init failed, falling back to NoDisplay");
             delete epaper;
             display_ = new NoDisplay();
         }
@@ -113,10 +103,9 @@ public:
     CompactWifiBoard()
         : WifiBoard(),
           boot_button_(BOOT_BUTTON_GPIO),
-          touch_button_(TOUCH_BUTTON_GPIO),
           asr_button_(ASR_BUTTON_GPIO) {
-        // SSD1306 and LampController are intentionally not initialized.
-        // GPIO18 is reserved for the e-paper SPI clock.
+        // SSD1306, LampController and the GPIO5 touch button are intentionally
+        // not initialized. GPIO18 is reserved for the e-paper SPI clock.
         InitializeButtons();
         InitializeDisplay();
     }

@@ -1,4 +1,4 @@
-name: Build T42 Firmware
+name: Build GDEY075T7 Firmware
 
 on:
   push:
@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  build-t42:
-    name: Build bread-compact-esp32-epaper-t42
+  build-epaper:
+    name: Build bread-compact-esp32 GDEY075T7
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.0.2
@@ -19,27 +19,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore diagnostic board source
-        shell: bash
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git fetch --no-tags --depth=1 origin ecb417474d96298c0e0370f38b8b3c8ddad8e8e5
-          git checkout FETCH_HEAD -- main/boards/bread-compact-esp32/esp32_bread_board.cc
-
-      - name: Apply safe slow wiring test
-        shell: bash
-        run: |
-          python .github/t42_patch_wiretest.py
-
-      - name: Build T42 firmware
+      - name: Build firmware
         shell: bash
         run: |
           source $IDF_PATH/export.sh
           python scripts/build.py bread-compact-esp32 --name bread-compact-esp32-epaper-t42
 
-      - name: Upload firmware
+      - name: Prepare flash package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/merged-binary.bin dist/xiaozhi-bread-compact-esp32-gdey075t7-merged.bin
+          cat > dist/README.txt <<'EOF'
+          Xiaozhi bread-compact-esp32 + Waveshare e-Paper Driver HAT Rev2.3
+          Panel: GDEY075T7 / UC8179, 800x480
+
+          Final wiring:
+            VCC  -> 3V3
+            PWR  -> 3V3
+            GND  -> GND
+            DIN  -> GPIO23
+            CLK  -> GPIO18
+            CS   -> GPIO5
+            DC   -> GPIO17
+            RST  -> GPIO16
+            BUSY -> GPIO4
+
+          The merged image is intended to be flashed at address 0x0.
+          Example:
+            esptool.py --chip esp32 write_flash 0x0 xiaozhi-bread-compact-esp32-gdey075t7-merged.bin
+          EOF
+
+      - name: Upload firmware package
         uses: actions/upload-artifact@v4
         with:
-          name: xiaozhi_bread-compact-esp32-epaper-t42_${{ github.sha }}
-          path: build/merged-binary.bin
+          name: xiaozhi_bread-compact-esp32_gdey075t7_${{ github.sha }}
+          path: dist/
           if-no-files-found: error

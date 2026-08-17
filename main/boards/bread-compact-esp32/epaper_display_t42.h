@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <string>
 
+// Kept under the historical EpaperDisplayT42 class/file name so this remains a
+// board-local change. The low-level driver now targets GDEY075T7 / UC8179.
 class EpaperDisplayT42 : public LcdDisplay {
 public:
     EpaperDisplayT42();
@@ -42,7 +44,7 @@ private:
     TaskHandle_t refresh_task_handle_ = nullptr;
 
     bool ready_ = false;
-    bool power_rail_on_ = false;
+    bool panel_powered_ = false;
     volatile bool speaking_ = false;
     volatile bool streaming_refresh_ = false;
     volatile bool stream_invert_ = false;
@@ -64,6 +66,7 @@ private:
     bool InitializeLvgl();
     void NotifyRefresh();
     bool StreamCurrentUiToPanel(bool invert);
+    bool StreamSolidPlane(uint8_t value);
 
     void UpdateUserLabelLocked();
     void UpdateAssistantLabelLocked();
@@ -73,12 +76,11 @@ private:
     void SendCommand(uint8_t cmd);
     void SendData(uint8_t data);
 
-    void PowerRail(bool on);
     void HardwareReset();
     bool WaitBusyRelease(const char* reason, uint32_t timeout_ms);
     bool InitPanelFullRefresh();
     bool RefreshPanelFull();
-    void SleepAndPowerOff();
+    void SleepPanel();
 };
 
 #endif // EPAPER_DISPLAY_T42_H
