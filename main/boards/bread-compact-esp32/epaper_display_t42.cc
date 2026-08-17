@@ -1,41 +1,74 @@
 #include "epaper_display_t42.h"
-#include "config.h"
+
 #include "assets/lang_config.h"
+#include "config.h"
+#include "lunar_calendar.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 #include <driver/gpio.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
+#include <esp_timer.h>
 
-#define TAG "EpaperGDEY075T7"
+#define TAG "EpaperDeskDash"
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 
 namespace {
 constexpr spi_host_device_t kSpiHost = SPI3_HOST;
 constexpr size_t kSpiChunk = 4096;
-constexpr size_t kMaxUserBytes = 240;
-constexpr size_t kMaxAssistantBytes = 780;
-constexpr uint32_t kPartialDebounceMs = 250;
+constexpr size_t kMaxUserBytes = 180;
+constexpr size_t kMaxAssistantBytes = 420;
+constexpr uint32_t kPartialDebounceMs = 220;
 constexpr uint32_t kRefreshTriggerDelayMs = 100;
-constexpr uint32_t kPartialRefreshLimit = 20;
+constexpr uint32_t kPartialRefreshLimit = 90;
 
-// Full-width partial bands. Keeping X = 0..799 makes the LVGL capture path
-// simple and robust while still avoiding a full 480-line waveform refresh.
-constexpr int kStatusY0 = 0;
-constexpr int kStatusY1 = 72;
-constexpr int kUserY0 = 64;
-constexpr int kUserY1 = 196;
-constexpr int kAssistantY0 = 196;
-constexpr int kAssistantY1 = EPD_HEIGHT;
+struct Region { int x0; int y0; int x1; int y1; const char* name; };
+constexpr Region kClockRegion   {0,   0, 336, 136, "clock"};
+constexpr Region kHeaderRegion  {332, 0, 800, 136, "header"};
+constexpr Region kWeatherRegion {0, 132, 348, 304, "weather"};
+constexpr Region kTodoRegion    {344, 132, 534, 304, "todo"};
+constexpr Region kQuickRegion   {530, 132, 800, 304, "quick"};
+constexpr Region kWordRegion    {0, 300, 294, 480, "word"};
+constexpr Region kChatRegion    {290, 300, 800, 480, "chat"};
+
+constexpr uint8_t kDigitSegments[10] = {
+    0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110,
+    0b1101101, 0b1111101, 0b0000111, 0b1111111, 0b1101111,
+};
+
+bool ValidSystemTime(std::time_t now, struct tm* out) {
+    if (now <= 0 || out == nullptr || localtime_r(&now, out) == nullptr) return false;
+    return out->tm_year + 1900 >= 2024;
 }
+
+void StyleSolidBlack(lv_obj_t* obj) {
+    lv_obj_set_style_bg_color(obj, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_pad_all(obj, 0, 0);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+} // namespace
 
 EpaperDisplayT42::EpaperDisplayT42()
     : LcdDisplay(nullptr, nullptr, EPD_WIDTH, EPD_HEIGHT) {
+    dashboard_ = {};
+    data_provider_.FillStaticDefaults(dashboard_);
+
+    const auto& cfg = data_provider_.config();
+    setenv("TZ", cfg.timezone.c_str(), 1);
+    tzset();
+
     ESP_LOGI(TAG, "Heap before e-paper: free=%u largest=%u",
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
@@ -45,13 +78,8 @@ EpaperDisplayT42::EpaperDisplayT42()
         return;
     }
 
-    if (xTaskCreate(
-            RefreshTaskEntry,
-            "epaper_refresh",
-            4096,
-            this,
-            2,
-            &refresh_task_handle_) != pdPASS) {
+    if (xTaskCreate(RefreshTaskEntry, "epaper_refresh", 4096, this, 2,
+                    &refresh_task_handle_) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create e-paper refresh task");
         return;
     }
@@ -63,15 +91,17 @@ EpaperDisplayT42::EpaperDisplayT42()
 
     ready_ = true;
     ESP_LOGI(TAG,
-             "Ready: GDEY075T7 800x480, partial refresh enabled, PWR=3V3(always-on) BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
+             "Ready: GDEY075T7 800x480 dashboard, true-window partial refresh, "
+             "PWR=3V3 BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
              EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN,
              EPD_CS_PIN, EPD_SCLK_PIN, EPD_MOSI_PIN);
-    ESP_LOGI(TAG, "Heap after e-paper: free=%u largest=%u",
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
-             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
 }
 
 EpaperDisplayT42::~EpaperDisplayT42() {
+    if (data_task_handle_ != nullptr) {
+        vTaskDelete(data_task_handle_);
+        data_task_handle_ = nullptr;
+    }
     if (refresh_task_handle_ != nullptr) {
         vTaskDelete(refresh_task_handle_);
         refresh_task_handle_ = nullptr;
@@ -85,12 +115,10 @@ EpaperDisplayT42::~EpaperDisplayT42() {
         spi_ = nullptr;
         spi_bus_free(kSpiHost);
     }
-
     if (lvgl_buffer_ != nullptr) {
         heap_caps_free(lvgl_buffer_);
         lvgl_buffer_ = nullptr;
     }
-
     if (mono_line_ != nullptr) {
         heap_caps_free(mono_line_);
         mono_line_ = nullptr;
@@ -99,16 +127,12 @@ EpaperDisplayT42::~EpaperDisplayT42() {
 
 bool EpaperDisplayT42::InitializeHardware() {
     gpio_config_t out_cfg = {};
-    out_cfg.pin_bit_mask =
-        (1ULL << EPD_RST_PIN) |
-        (1ULL << EPD_DC_PIN);
+    out_cfg.pin_bit_mask = (1ULL << EPD_RST_PIN) | (1ULL << EPD_DC_PIN);
     out_cfg.mode = GPIO_MODE_OUTPUT;
     out_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     out_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     out_cfg.intr_type = GPIO_INTR_DISABLE;
-    if (gpio_config(&out_cfg) != ESP_OK) {
-        return false;
-    }
+    if (gpio_config(&out_cfg) != ESP_OK) return false;
 
     gpio_config_t busy_cfg = {};
     busy_cfg.pin_bit_mask = (1ULL << EPD_BUSY_PIN);
@@ -116,9 +140,7 @@ bool EpaperDisplayT42::InitializeHardware() {
     busy_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     busy_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     busy_cfg.intr_type = GPIO_INTR_DISABLE;
-    if (gpio_config(&busy_cfg) != ESP_OK) {
-        return false;
-    }
+    if (gpio_config(&busy_cfg) != ESP_OK) return false;
 
     gpio_set_level(EPD_RST_PIN, 1);
     gpio_set_level(EPD_DC_PIN, 1);
@@ -159,19 +181,15 @@ bool EpaperDisplayT42::InitializeHardware() {
         spi_bus_free(kSpiHost);
         return false;
     }
-
     return true;
 }
 
 bool EpaperDisplayT42::InitializeLvgl() {
-    ESP_LOGI(TAG, "Initialize LVGL for low-memory e-paper streaming");
-
     lv_init();
 
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_priority = 2;
     port_cfg.timer_period_ms = 50;
-
     esp_err_t err = lvgl_port_init(&port_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "lvgl_port_init failed: %s", esp_err_to_name(err));
@@ -179,9 +197,7 @@ bool EpaperDisplayT42::InitializeLvgl() {
     }
 
     const size_t buffer_size =
-        EPD_WIDTH * LVGL_BUFFER_ROWS *
-        LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565);
-
+        EPD_WIDTH * LVGL_BUFFER_ROWS * LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565);
     lvgl_buffer_ = static_cast<uint8_t*>(
         heap_caps_malloc(buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (lvgl_buffer_ == nullptr) {
@@ -194,37 +210,163 @@ bool EpaperDisplayT42::InitializeLvgl() {
     display_ = lv_display_create(EPD_WIDTH, EPD_HEIGHT);
     if (display_ == nullptr) {
         lvgl_port_unlock();
-        ESP_LOGE(TAG, "lv_display_create failed");
         return false;
     }
-
     lv_display_set_color_format(display_, LV_COLOR_FORMAT_RGB565);
     lv_display_set_flush_cb(display_, LvglFlushCb);
     lv_display_set_user_data(display_, this);
-    lv_display_set_buffers(
-        display_,
-        lvgl_buffer_,
-        nullptr,
-        buffer_size,
-        LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(display_, lvgl_buffer_, nullptr, buffer_size,
+                           LV_DISPLAY_RENDER_MODE_PARTIAL);
     lvgl_port_unlock();
-
     return true;
 }
 
-void EpaperDisplayT42::SetupUI() {
-    if (setup_ui_called_) {
-        return;
+lv_obj_t* EpaperDisplayT42::CreateBox(lv_obj_t* screen, int x, int y, int w, int h) {
+    lv_obj_t* box = lv_obj_create(screen);
+    lv_obj_set_pos(box, x, y);
+    lv_obj_set_size(box, w, h);
+    lv_obj_set_style_radius(box, 6, 0);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_border_color(box, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(box, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(box, 0, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    return box;
+}
+
+lv_obj_t* EpaperDisplayT42::CreateLabel(
+    lv_obj_t* screen, int x, int y, int w, const char* text, lv_text_align_t align) {
+    lv_obj_t* label = lv_label_create(screen);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_width(label, w);
+    lv_label_set_text(label, text != nullptr ? text : "");
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
+    lv_obj_set_style_text_font(label, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_text_align(label, align, 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(label, 0, 0);
+    return label;
+}
+
+void EpaperDisplayT42::CreateSevenSegmentClock(lv_obj_t* screen) {
+    constexpr int x0 = 24;
+    constexpr int y0 = 18;
+    constexpr int digit_w = 50;
+    constexpr int digit_h = 72;
+    constexpr int t = 7;
+    constexpr int gap = 8;
+    const int digit_x[4] = {x0, x0 + digit_w + gap, x0 + 2 * digit_w + 3 * gap,
+                            x0 + 3 * digit_w + 4 * gap};
+
+    for (int d = 0; d < 4; ++d) {
+        const int x = digit_x[d];
+        auto make_seg = [&](int sx, int sy, int sw, int sh) -> lv_obj_t* {
+            lv_obj_t* seg = lv_obj_create(screen);
+            lv_obj_set_pos(seg, sx, sy);
+            lv_obj_set_size(seg, sw, sh);
+            lv_obj_set_style_radius(seg, std::min(sw, sh) / 2, 0);
+            StyleSolidBlack(seg);
+            return seg;
+        };
+
+        clock_segments_[d][0] = make_seg(x + t, y0, digit_w - 2 * t, t);
+        clock_segments_[d][1] = make_seg(x + digit_w - t, y0 + t, t, digit_h / 2 - t);
+        clock_segments_[d][2] = make_seg(x + digit_w - t, y0 + digit_h / 2, t, digit_h / 2 - t);
+        clock_segments_[d][3] = make_seg(x + t, y0 + digit_h - t, digit_w - 2 * t, t);
+        clock_segments_[d][4] = make_seg(x, y0 + digit_h / 2, t, digit_h / 2 - t);
+        clock_segments_[d][5] = make_seg(x, y0 + t, t, digit_h / 2 - t);
+        clock_segments_[d][6] = make_seg(x + t, y0 + digit_h / 2 - t / 2, digit_w - 2 * t, t);
     }
+
+    const int colon_x = x0 + 2 * digit_w + 2 * gap;
+    for (int i = 0; i < 2; ++i) {
+        clock_colon_[i] = lv_obj_create(screen);
+        lv_obj_set_pos(clock_colon_[i], colon_x, y0 + 22 + i * 28);
+        lv_obj_set_size(clock_colon_[i], 8, 8);
+        lv_obj_set_style_radius(clock_colon_[i], 4, 0);
+        StyleSolidBlack(clock_colon_[i]);
+    }
+}
+
+void EpaperDisplayT42::SetClockDigit(int index, int digit) {
+    if (index < 0 || index >= 4 || digit < 0 || digit > 9) return;
+    if (clock_digits_[index] == digit) return;
+    clock_digits_[index] = digit;
+    const uint8_t mask = kDigitSegments[digit];
+    for (int s = 0; s < 7; ++s) {
+        lv_obj_t* seg = clock_segments_[index][s];
+        if (seg == nullptr) continue;
+        if ((mask & (1u << s)) != 0) lv_obj_clear_flag(seg, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(seg, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
+    CreateBox(screen, 5, 5, 326, 126);
+    CreateBox(screen, 336, 5, 459, 126);
+    CreateBox(screen, 5, 137, 339, 162);
+    CreateBox(screen, 349, 137, 181, 162);
+    CreateBox(screen, 535, 137, 260, 162);
+    CreateBox(screen, 5, 305, 284, 170);
+    CreateBox(screen, 294, 305, 501, 170);
+
+    CreateSevenSegmentClock(screen);
+    date_label_ = CreateLabel(screen, 22, 96, 295, "日期");
+    lunar_label_ = CreateLabel(screen, 22, 113, 295, "农历");
+
+    CreateLabel(screen, 354, 17, 60, "●  ●");
+    CreateLabel(screen, 416, 16, 230, "小智桌面屏");
+    CreateLabel(screen, 676, 18, 105, "USB | WiFi", LV_TEXT_ALIGN_RIGHT);
+    status_label_ = CreateLabel(screen, 416, 48, 350, "已联网 | 正在启动");
+    CreateLabel(screen, 354, 83, 420, "可问：天气 · 日程 · 提醒 · 设备状态");
+
+    weather_title_label_ = CreateLabel(screen, 20, 147, 310, "北京 · 天气");
+    weather_current_label_ = CreateLabel(screen, 20, 175, 310, "今日 多云  28°  30°/24°");
+    weather_aqi_label_ = CreateLabel(screen, 20, 198, 310, "AQI 52 优");
+    weather_forecast_labels_[0] = CreateLabel(screen, 20, 225, 310, "周二 晴 31°/24°");
+    weather_forecast_labels_[1] = CreateLabel(screen, 20, 248, 310, "周三 小雨 28°/23°");
+    weather_forecast_labels_[2] = CreateLabel(screen, 20, 271, 310, "周四 阴 27°/22°");
+
+    CreateLabel(screen, 362, 148, 155, "今日待办");
+    todo_labels_[0] = CreateLabel(screen, 362, 176, 156, "");
+    todo_labels_[1] = CreateLabel(screen, 362, 218, 156, "");
+    todo_labels_[2] = CreateLabel(screen, 362, 260, 156, "");
+
+    quick_labels_[0] = CreateLabel(screen, 548, 149, 232, "");
+    quick_labels_[1] = CreateLabel(screen, 548, 186, 232, "");
+    quick_labels_[2] = CreateLabel(screen, 548, 223, 232, "");
+    quick_labels_[3] = CreateLabel(screen, 548, 260, 232, "");
+
+    CreateLabel(screen, 18, 316, 240, "每日记单词");
+    word_label_ = CreateLabel(screen, 18, 340, 250, "abandon");
+    phonetic_label_ = CreateLabel(screen, 18, 361, 250, "/əˈbændən/");
+    meaning_label_ = CreateLabel(screen, 18, 382, 250, "放弃；遗弃");
+    example_label_ = CreateLabel(screen, 18, 405, 255, "例：Don't abandon your plan.\n不要放弃你的计划。");
+    word_footer_label_ = CreateLabel(screen, 18, 452, 255, "20词 · 30分钟轮播 · 1/20");
+
+    user_label_ = CreateLabel(screen, 310, 318, 468, "你：等待你说话");
+    assistant_label_ = CreateLabel(screen, 310, 357, 468, "小智：准备好了，随时可以聊。");
+    CreateLabel(screen, 310, 447, 468,
+                "说“小智小智”唤醒 | 按键说话 | 天气 · 日程 · 提醒 · 设备");
+
+    UpdateClockLocked(true);
+    UpdateHeaderLocked();
+    UpdateWeatherLocked();
+    UpdateTodoLocked();
+    UpdateQuickLocked();
+    UpdateWordLocked();
+    UpdateChatLocked();
+}
+
+void EpaperDisplayT42::SetupUI() {
+    if (setup_ui_called_) return;
 
     Display::SetupUI();
     DisplayLockGuard lock(this);
-
     lv_obj_t* screen = lv_display_get_screen_active(display_);
-    if (screen == nullptr) {
-        ESP_LOGE(TAG, "No active LVGL screen");
-        return;
-    }
+    if (screen == nullptr) return;
 
     lv_obj_clean(screen);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
@@ -234,64 +376,149 @@ void EpaperDisplayT42::SetupUI() {
     lv_obj_set_style_text_font(screen, &BUILTIN_TEXT_FONT, 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
 
-    title_label_ = lv_label_create(screen);
-    lv_label_set_text(title_label_, "小智");
-    lv_obj_set_pos(title_label_, 32, 20);
-    lv_obj_set_style_text_color(title_label_, lv_color_black(), 0);
-    lv_obj_set_style_text_font(title_label_, &BUILTIN_TEXT_FONT, 0);
-
-    status_label_ = lv_label_create(screen);
-    status_text_ = "正在启动";
-    lv_label_set_text(status_label_, status_text_.c_str());
-    lv_obj_set_width(status_label_, 560);
-    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_style_text_color(status_label_, lv_color_black(), 0);
-    lv_obj_set_style_text_font(status_label_, &BUILTIN_TEXT_FONT, 0);
-    lv_obj_align(status_label_, LV_ALIGN_TOP_RIGHT, -32, 20);
-
-    auto add_divider = [screen](int y) {
-        lv_obj_t* line = lv_obj_create(screen);
-        lv_obj_set_pos(line, 32, y);
-        lv_obj_set_size(line, EPD_WIDTH - 64, 2);
-        lv_obj_set_style_radius(line, 0, 0);
-        lv_obj_set_style_border_width(line, 0, 0);
-        lv_obj_set_style_pad_all(line, 0, 0);
-        lv_obj_set_style_bg_color(line, lv_color_black(), 0);
-        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
-        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
-    };
-
-    add_divider(58);
-    add_divider(188);
-
-    user_label_ = lv_label_create(screen);
-    lv_obj_set_pos(user_label_, 32, 80);
-    lv_obj_set_size(user_label_, EPD_WIDTH - 64, 88);
-    lv_label_set_long_mode(user_label_, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(user_label_, lv_color_black(), 0);
-    lv_obj_set_style_text_font(user_label_, &BUILTIN_TEXT_FONT, 0);
-    lv_obj_set_style_text_line_space(user_label_, 5, 0);
-
-    assistant_label_ = lv_label_create(screen);
-    lv_obj_set_pos(assistant_label_, 32, 210);
-    lv_obj_set_size(assistant_label_, EPD_WIDTH - 64, 238);
-    lv_label_set_long_mode(assistant_label_, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(assistant_label_, lv_color_black(), 0);
-    lv_obj_set_style_text_font(assistant_label_, &BUILTIN_TEXT_FONT, 0);
-    lv_obj_set_style_text_line_space(assistant_label_, 6, 0);
-
-    UpdateUserLabelLocked();
-    UpdateAssistantLabelLocked();
-
-    ESP_LOGI(TAG, "E-paper compact UI ready");
+    BuildDashboardUi(screen);
+    ESP_LOGI(TAG, "Desk dashboard UI ready");
     NotifyRefresh(REFRESH_FULL);
+
+    if (data_task_handle_ == nullptr) {
+        if (xTaskCreate(DataTaskEntry, "epaper_data", 7168, this, 1,
+                        &data_task_handle_) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create dashboard data task");
+        }
+    }
+}
+
+const char* EpaperDisplayT42::WeekdayName(int tm_wday) {
+    static constexpr const char* kNames[] =
+        {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
+    return (tm_wday >= 0 && tm_wday <= 6) ? kNames[tm_wday] : "周?";
+}
+
+void EpaperDisplayT42::UpdateClockLocked(bool force) {
+    std::time_t now = std::time(nullptr);
+    struct tm local = {};
+    if (!ValidSystemTime(now, &local)) {
+        if (force) {
+            if (date_label_ != nullptr) lv_label_set_text(date_label_, "等待时间同步 · 北京");
+            if (lunar_label_ != nullptr) lv_label_set_text(lunar_label_, "农历日期");
+        }
+        return;
+    }
+
+    const int minute_key = local.tm_hour * 60 + local.tm_min;
+    if (!force && minute_key == last_clock_minute_ && local.tm_yday == last_clock_yday_) return;
+
+    SetClockDigit(0, local.tm_hour / 10);
+    SetClockDigit(1, local.tm_hour % 10);
+    SetClockDigit(2, local.tm_min / 10);
+    SetClockDigit(3, local.tm_min % 10);
+
+    char date[96];
+    std::snprintf(date, sizeof(date), "%d月%d日 %s · %s",
+                  local.tm_mon + 1, local.tm_mday, WeekdayName(local.tm_wday),
+                  data_provider_.config().city.c_str());
+    if (date_label_ != nullptr) lv_label_set_text(date_label_, date);
+
+    const std::string lunar = epaper_dashboard::FormatLunarDate(
+        local.tm_year + 1900, local.tm_mon + 1, local.tm_mday);
+    if (lunar_label_ != nullptr) lv_label_set_text(lunar_label_, lunar.c_str());
+
+    last_clock_minute_ = minute_key;
+    last_clock_yday_ = local.tm_yday;
+}
+
+void EpaperDisplayT42::UpdateHeaderLocked() {
+    if (status_label_ == nullptr) return;
+    std::string status = "已联网 | ";
+    status += status_text_.empty() ? "待唤醒" : status_text_;
+    lv_label_set_text(status_label_, status.c_str());
+}
+
+void EpaperDisplayT42::UpdateWeatherLocked() {
+    char buf[192];
+    const auto& w = dashboard_.weather;
+    std::snprintf(buf, sizeof(buf), "%s · %s %s",
+                  w.city.c_str(), w.live ? "更新" : "静态", w.updated.c_str());
+    lv_label_set_text(weather_title_label_, buf);
+
+    std::snprintf(buf, sizeof(buf), "今日 %s  %d°  %d°/%d°",
+                  epaper_dashboard::DashboardDataProvider::WeatherText(w.current_code),
+                  w.current_temp, w.days[0].temp_max, w.days[0].temp_min);
+    lv_label_set_text(weather_current_label_, buf);
+
+    std::snprintf(buf, sizeof(buf), "AQI %d %s", w.aqi, w.aqi_grade.c_str());
+    lv_label_set_text(weather_aqi_label_, buf);
+
+    std::time_t now = std::time(nullptr);
+    struct tm local = {};
+    const bool time_ok = ValidSystemTime(now, &local);
+    for (int i = 0; i < 3; ++i) {
+        const auto& day = w.days[i + 1];
+        const int weekday = time_ok ? (local.tm_wday + i + 1) % 7 : (i + 2);
+        std::snprintf(buf, sizeof(buf), "%s %s  %d°/%d°",
+                      WeekdayName(weekday),
+                      epaper_dashboard::DashboardDataProvider::WeatherText(day.weather_code),
+                      day.temp_max, day.temp_min);
+        lv_label_set_text(weather_forecast_labels_[i], buf);
+    }
+}
+
+void EpaperDisplayT42::UpdateTodoLocked() {
+    char buf[160];
+    for (size_t i = 0; i < todo_labels_.size(); ++i) {
+        const auto& item = dashboard_.todos[i];
+        std::snprintf(buf, sizeof(buf), "○ %s %s\n   %s",
+                      item.time.c_str(), item.title.c_str(), item.detail.c_str());
+        lv_label_set_text(todo_labels_[i], buf);
+    }
+}
+
+void EpaperDisplayT42::UpdateQuickLocked() {
+    const epaper_dashboard::QuickItem* items[] = {
+        &dashboard_.commute, &dashboard_.parcel, &dashboard_.home, &dashboard_.market
+    };
+    char buf[192];
+    for (size_t i = 0; i < quick_labels_.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "%s  %s\n%s",
+                      items[i]->title.c_str(), items[i]->line1.c_str(), items[i]->line2.c_str());
+        lv_label_set_text(quick_labels_[i], buf);
+    }
+}
+
+void EpaperDisplayT42::UpdateWordLocked() {
+    const auto& word = dashboard_.word;
+    lv_label_set_text(word_label_, word.word.c_str());
+    lv_label_set_text(phonetic_label_, word.phonetic.c_str());
+    lv_label_set_text(meaning_label_, word.meaning.c_str());
+
+    std::string example = "例：" + word.example;
+    if (!word.translation.empty()) example += "\n" + word.translation;
+    example = TruncateUtf8(example, 150);
+    lv_label_set_text(example_label_, example.c_str());
+
+    char footer[128];
+    std::snprintf(footer, sizeof(footer), "今日%d词 · %d分钟轮播 · 第%d/%d个",
+                  word.total, data_provider_.config().word_rotate_minutes,
+                  word.index, word.total);
+    lv_label_set_text(word_footer_label_, footer);
+}
+
+void EpaperDisplayT42::UpdateChatLocked() {
+    if (user_label_ != nullptr) {
+        std::string text = "你：" + (user_text_.empty() ? std::string("等待你说话")
+                                                       : TruncateUtf8(user_text_, kMaxUserBytes));
+        lv_label_set_text(user_label_, text.c_str());
+    }
+    if (assistant_label_ != nullptr) {
+        std::string text = "小智：" +
+            (assistant_text_.empty() ? std::string("准备好了，随时可以聊。")
+                                     : TruncateUtf8(assistant_text_, kMaxAssistantBytes));
+        lv_label_set_text(assistant_label_, text.c_str());
+    }
 }
 
 std::string EpaperDisplayT42::TruncateUtf8(const std::string& text, size_t max_bytes) {
-    if (text.size() <= max_bytes) {
-        return text;
-    }
-
+    if (text.size() <= max_bytes) return text;
     size_t end = max_bytes;
     while (end > 0 && end < text.size() &&
            (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
@@ -300,63 +527,35 @@ std::string EpaperDisplayT42::TruncateUtf8(const std::string& text, size_t max_b
     return text.substr(0, end) + "...";
 }
 
-void EpaperDisplayT42::UpdateUserLabelLocked() {
-    if (user_label_ == nullptr) {
-        return;
-    }
-    std::string text = "你：";
-    text += user_text_.empty() ? "等待你说话" : TruncateUtf8(user_text_, kMaxUserBytes);
-    lv_label_set_text(user_label_, text.c_str());
-}
-
-void EpaperDisplayT42::UpdateAssistantLabelLocked() {
-    if (assistant_label_ == nullptr) {
-        return;
-    }
-    std::string text = "小智：";
-    text += assistant_text_.empty() ? "准备好了，随时可以聊。" : TruncateUtf8(assistant_text_, kMaxAssistantBytes);
-    lv_label_set_text(assistant_label_, text.c_str());
-}
-
 void EpaperDisplayT42::SetStatus(const char* status) {
-    if (status == nullptr) {
-        return;
-    }
-
+    if (status == nullptr) return;
     Display::SetStatus(status);
+
     const bool is_speaking = (std::strcmp(status, Lang::Strings::SPEAKING) == 0);
     speaking_ = is_speaking;
     status_text_ = status;
 
     if (setup_ui_called_ && status_label_ != nullptr) {
         DisplayLockGuard lock(this);
-        lv_label_set_text(status_label_, status_text_.c_str());
+        UpdateHeaderLocked();
     }
 
-    pending_refresh_mask_.fetch_or(REFRESH_STATUS, std::memory_order_relaxed);
-    // While TTS is active, assistant chunks accumulate without physical refresh.
-    // The status transition after speaking ends wakes the task and refreshes all
-    // dirty bands in one partial-mode session.
-    if (!is_speaking) {
-        NotifyRefresh(REFRESH_STATUS);
-    }
+    pending_refresh_mask_.fetch_or(REFRESH_HEADER, std::memory_order_relaxed);
+    if (!is_speaking) NotifyRefresh(REFRESH_HEADER);
 }
 
 void EpaperDisplayT42::ShowNotification(const char* notification, int duration_ms) {
     (void)duration_ms;
-    if (notification == nullptr || notification[0] == '\0') {
-        return;
-    }
+    if (notification == nullptr || notification[0] == '\0') return;
     Display::ShowNotification(notification, duration_ms);
     status_text_ = notification;
-    if (setup_ui_called_ && status_label_ != nullptr) {
+
+    if (setup_ui_called_) {
         DisplayLockGuard lock(this);
-        lv_label_set_text(status_label_, status_text_.c_str());
+        UpdateHeaderLocked();
     }
-    pending_refresh_mask_.fetch_or(REFRESH_STATUS, std::memory_order_relaxed);
-    if (!speaking_) {
-        NotifyRefresh(REFRESH_STATUS);
-    }
+    pending_refresh_mask_.fetch_or(REFRESH_HEADER, std::memory_order_relaxed);
+    if (!speaking_) NotifyRefresh(REFRESH_HEADER);
 }
 
 void EpaperDisplayT42::ShowNotification(const std::string& notification, int duration_ms) {
@@ -368,69 +567,140 @@ void EpaperDisplayT42::SetEmotion(const char* emotion) {
 }
 
 void EpaperDisplayT42::SetChatMessage(const char* role, const char* content) {
-    if (role == nullptr || content == nullptr) {
-        return;
-    }
-
+    if (role == nullptr || content == nullptr) return;
     Display::SetChatMessage(role, content);
 
-    uint32_t dirty_mask = REFRESH_NONE;
+    bool changed = false;
     if (std::strcmp(role, "user") == 0) {
         user_text_ = content;
         assistant_text_.clear();
-        dirty_mask = REFRESH_USER | REFRESH_ASSISTANT;
+        changed = true;
     } else if (std::strcmp(role, "assistant") == 0) {
         if (content[0] != '\0') {
             assistant_text_ += content;
-            dirty_mask = REFRESH_ASSISTANT;
+            changed = true;
         }
     } else if (std::strcmp(role, "system") == 0) {
         if (content[0] != '\0' && std::strstr(content, "bread-compact-esp32") == nullptr) {
             assistant_text_ = content;
-            dirty_mask = REFRESH_ASSISTANT;
+            changed = true;
         }
     }
-
-    if (dirty_mask == REFRESH_NONE) {
-        return;
-    }
+    if (!changed) return;
 
     if (setup_ui_called_) {
         DisplayLockGuard lock(this);
-        UpdateUserLabelLocked();
-        UpdateAssistantLabelLocked();
+        UpdateChatLocked();
     }
-
-    pending_refresh_mask_.fetch_or(dirty_mask, std::memory_order_relaxed);
-    if (!speaking_) {
-        NotifyRefresh(dirty_mask);
-    }
+    pending_refresh_mask_.fetch_or(REFRESH_CHAT, std::memory_order_relaxed);
+    if (!speaking_) NotifyRefresh(REFRESH_CHAT);
 }
 
 void EpaperDisplayT42::ClearChatMessages() {
-    ESP_LOGI(TAG, "Preserve last Q&A on ClearChatMessages");
+    ESP_LOGI(TAG, "Preserve last Q&A on e-paper");
 }
 
 void EpaperDisplayT42::UpdateStatusBar(bool update_all) {
     (void)update_all;
-    // No periodic 1 Hz refresh on e-paper.
 }
 
 void EpaperDisplayT42::SetPowerSaveMode(bool on) {
     (void)on;
-    // HAT PWR is tied to 3V3. UC8179 deep sleep is entered after each physical batch.
+}
+
+void EpaperDisplayT42::DataTaskEntry(void* arg) {
+    static_cast<EpaperDisplayT42*>(arg)->DataTaskLoop();
+}
+
+void EpaperDisplayT42::DataTaskLoop() {
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    const auto& cfg = data_provider_.config();
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int64_t next_weather_ms = now_ms;
+    int64_t next_api_ms = now_ms + 3000;
+    int64_t next_full_ms = now_ms + static_cast<int64_t>(cfg.full_refresh_minutes) * 60000;
+
+    for (;;) {
+        const std::time_t now = std::time(nullptr);
+        struct tm local = {};
+        if (ValidSystemTime(now, &local)) {
+            const int minute_key = local.tm_hour * 60 + local.tm_min;
+            const bool clock_changed =
+                minute_key != last_clock_minute_ || local.tm_yday != last_clock_yday_;
+            if (clock_changed) {
+                {
+                    DisplayLockGuard lock(this);
+                    UpdateClockLocked(false);
+                }
+                NotifyRefresh(REFRESH_CLOCK);
+            }
+
+            const int word_slot =
+                (local.tm_hour * 60 + local.tm_min) / std::max(5, cfg.word_rotate_minutes);
+            if (!dashboard_.custom_api_live && word_slot != last_word_slot_) {
+                dashboard_.word = data_provider_.GetLocalWord(now);
+                last_word_slot_ = word_slot;
+                {
+                    DisplayLockGuard lock(this);
+                    UpdateWordLocked();
+                }
+                NotifyRefresh(REFRESH_WORD);
+            }
+        }
+
+        now_ms = esp_timer_get_time() / 1000;
+        if (now_ms >= next_weather_ms) {
+            auto weather = dashboard_.weather;
+            if (data_provider_.FetchWeather(weather)) {
+                dashboard_.weather = weather;
+                {
+                    DisplayLockGuard lock(this);
+                    UpdateWeatherLocked();
+                }
+                NotifyRefresh(REFRESH_WEATHER);
+                next_weather_ms =
+                    now_ms + static_cast<int64_t>(cfg.weather_refresh_minutes) * 60000;
+            } else {
+                next_weather_ms = now_ms + 120000;
+            }
+        }
+
+        if (!cfg.custom_api_url.empty() && now_ms >= next_api_ms) {
+            auto candidate = dashboard_;
+            if (data_provider_.FetchCustomDashboard(candidate)) {
+                dashboard_ = candidate;
+                {
+                    DisplayLockGuard lock(this);
+                    UpdateTodoLocked();
+                    UpdateQuickLocked();
+                    UpdateWordLocked();
+                }
+                NotifyRefresh(REFRESH_TODO | REFRESH_QUICK | REFRESH_WORD);
+                next_api_ms =
+                    now_ms + static_cast<int64_t>(cfg.custom_api_refresh_minutes) * 60000;
+            } else {
+                next_api_ms = now_ms + 120000;
+            }
+        }
+
+        if (now_ms >= next_full_ms) {
+            ESP_LOGI(TAG, "Scheduled anti-ghost full refresh");
+            NotifyRefresh(REFRESH_FULL);
+            next_full_ms = now_ms + static_cast<int64_t>(cfg.full_refresh_minutes) * 60000;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 }
 
 void EpaperDisplayT42::LvglFlushCb(
-    lv_display_t* disp,
-    const lv_area_t* area,
-    uint8_t* color_p) {
+    lv_display_t* disp, const lv_area_t* area, uint8_t* color_p) {
     auto* self = static_cast<EpaperDisplayT42*>(lv_display_get_user_data(disp));
     if (self == nullptr) {
         lv_display_flush_ready(disp);
         return;
     }
-
     if (!self->streaming_refresh_) {
         lv_display_flush_ready(disp);
         return;
@@ -441,7 +711,7 @@ void EpaperDisplayT42::LvglFlushCb(
     auto* pixels = reinterpret_cast<uint16_t*>(color_p);
 
     if (self->capture_partial_) {
-        if (self->partial_buffer_ == nullptr) {
+        if (self->partial_buffer_ == nullptr || self->partial_row_bytes_ == 0) {
             self->stream_error_ = true;
             lv_display_flush_ready(disp);
             return;
@@ -454,35 +724,32 @@ void EpaperDisplayT42::LvglFlushCb(
 
         if (x0 <= x1 && y0 <= y1) {
             for (int y = y0; y <= y1; ++y) {
-                const size_t dst_row = static_cast<size_t>(y - self->capture_area_.y1) * MONO_LINE_BYTES;
-                const size_t src_row = static_cast<size_t>(y - area->y1) * area_width;
+                const size_t dst_row =
+                    static_cast<size_t>(y - self->capture_area_.y1) * self->partial_row_bytes_;
+                const size_t src_row =
+                    static_cast<size_t>(y - area->y1) * static_cast<size_t>(area_width);
+
                 for (int x = x0; x <= x1; ++x) {
                     const uint16_t p = pixels[src_row + static_cast<size_t>(x - area->x1)];
                     const uint32_t r = (p >> 11) & 0x1F;
                     const uint32_t g = (p >> 5) & 0x3F;
                     const uint32_t b = p & 0x1F;
                     const uint32_t lum =
-                        (r * 255 / 31) * 299 +
-                        (g * 255 / 63) * 587 +
-                        (b * 255 / 31) * 114;
+                        (r * 255 / 31) * 299 + (g * 255 / 63) * 587 + (b * 255 / 31) * 114;
 
-                    uint8_t& out = self->partial_buffer_[dst_row + (x >> 3)];
-                    const uint8_t bit = static_cast<uint8_t>(0x80 >> (x & 7));
-                    if (lum < 128000) {
-                        out &= static_cast<uint8_t>(~bit); // 0 = black
-                    } else {
-                        out |= bit; // 1 = white
-                    }
+                    const int local_x = x - self->capture_area_.x1;
+                    uint8_t& out =
+                        self->partial_buffer_[dst_row + static_cast<size_t>(local_x >> 3)];
+                    const uint8_t bit = static_cast<uint8_t>(0x80 >> (local_x & 7));
+                    if (lum < 128000) out &= static_cast<uint8_t>(~bit);
+                    else out |= bit;
                 }
             }
         }
-
         lv_display_flush_ready(disp);
         return;
     }
 
-    // Full-screen streaming intentionally keeps no 48KB framebuffer. A full
-    // invalidation with the 4-row LVGL buffer arrives as full-width stripes.
     if (self->mono_line_ == nullptr ||
         area->x1 != 0 || area->x2 != (EPD_WIDTH - 1)) {
         ESP_LOGE(TAG, "Unexpected full stream area x=%d..%d y=%d..%d",
@@ -500,10 +767,7 @@ void EpaperDisplayT42::LvglFlushCb(
             const uint32_t g = (p >> 5) & 0x3F;
             const uint32_t b = p & 0x1F;
             const uint32_t lum =
-                (r * 255 / 31) * 299 +
-                (g * 255 / 63) * 587 +
-                (b * 255 / 31) * 114;
-
+                (r * 255 / 31) * 299 + (g * 255 / 63) * 587 + (b * 255 / 31) * 114;
             if (lum < 128000) {
                 self->mono_line_[x >> 3] &=
                     static_cast<uint8_t>(~(0x80 >> (x & 7)));
@@ -516,7 +780,6 @@ void EpaperDisplayT42::LvglFlushCb(
             break;
         }
     }
-
     lv_display_flush_ready(disp);
 }
 
@@ -534,49 +797,36 @@ void EpaperDisplayT42::RefreshTaskEntry(void* arg) {
 void EpaperDisplayT42::RefreshTaskLoop() {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        while (ulTaskNotifyTake(
-                   pdTRUE,
-                   pdMS_TO_TICKS(kPartialDebounceMs)) > 0) {
-        }
+        while (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kPartialDebounceMs)) > 0) {}
 
         if (speaking_) {
             ESP_LOGI(TAG, "Refresh deferred while TTS is speaking");
             continue;
         }
 
-        uint32_t mask = pending_refresh_mask_.exchange(REFRESH_NONE, std::memory_order_acq_rel);
-        if (mask == REFRESH_NONE) {
-            continue;
-        }
+        uint32_t mask =
+            pending_refresh_mask_.exchange(REFRESH_NONE, std::memory_order_acq_rel);
+        if (mask == REFRESH_NONE) continue;
 
         const bool force_full =
             !full_refresh_done_ ||
             ((mask & REFRESH_FULL) != 0) ||
             (partial_refresh_count_ >= kPartialRefreshLimit);
 
-        bool ok = false;
-        if (force_full) {
+        bool ok = force_full ? RefreshPanelFull() : RefreshPanelPartial(mask);
+        if (!ok && !force_full) {
+            ESP_LOGW(TAG, "Partial refresh failed; falling back to full refresh");
             ok = RefreshPanelFull();
-        } else {
-            ok = RefreshPanelPartial(mask);
-            if (!ok) {
-                ESP_LOGW(TAG, "Partial refresh failed; falling back to full refresh");
-                ok = RefreshPanelFull();
-            }
         }
-
         if (!ok) {
-            ESP_LOGE(TAG, "Panel refresh failed; dirty mask retained for retry");
+            ESP_LOGE(TAG, "Panel refresh failed; dirty mask retained");
             pending_refresh_mask_.fetch_or(mask, std::memory_order_relaxed);
         }
     }
 }
 
 bool EpaperDisplayT42::StreamCurrentUiToPanel() {
-    if (display_ == nullptr) {
-        return false;
-    }
+    if (display_ == nullptr) return false;
 
     stream_error_ = false;
     capture_partial_ = false;
@@ -597,41 +847,41 @@ bool EpaperDisplayT42::StreamCurrentUiToPanel() {
 }
 
 bool EpaperDisplayT42::StreamSolidPlane(uint8_t value) {
-    if (mono_line_ == nullptr) {
-        return false;
-    }
-
+    if (mono_line_ == nullptr) return false;
     std::memset(mono_line_, value, MONO_LINE_BYTES);
     gpio_set_level(EPD_DC_PIN, 1);
     for (int y = 0; y < EPD_HEIGHT; ++y) {
-        if (SpiWrite(mono_line_, MONO_LINE_BYTES) != ESP_OK) {
-            return false;
-        }
+        if (SpiWrite(mono_line_, MONO_LINE_BYTES) != ESP_OK) return false;
     }
     return true;
 }
 
-bool EpaperDisplayT42::CaptureUiRegion(int y_start, int y_end) {
+bool EpaperDisplayT42::CaptureUiRegion(
+    int x_start, int y_start, int x_end, int y_end) {
+    x_start = std::max(0, x_start);
     y_start = std::max(0, y_start);
+    x_end = std::min(EPD_WIDTH, x_end);
     y_end = std::min(EPD_HEIGHT, y_end);
-    if (display_ == nullptr || y_start >= y_end) {
-        return false;
-    }
+    if (display_ == nullptr || x_start >= x_end || y_start >= y_end) return false;
 
-    const size_t required = MONO_LINE_BYTES * static_cast<size_t>(y_end - y_start);
+    x_start &= ~7;
+    x_end = std::min(EPD_WIDTH, (x_end + 7) & ~7);
+    const size_t row_bytes = static_cast<size_t>((x_end - x_start) / 8);
+    const size_t required = row_bytes * static_cast<size_t>(y_end - y_start);
+
     ReleasePartialBuffer();
-    partial_buffer_ = static_cast<uint8_t*>(
-        heap_caps_malloc(required, MALLOC_CAP_8BIT));
+    partial_row_bytes_ = row_bytes;
+    partial_buffer_ = static_cast<uint8_t*>(heap_caps_malloc(required, MALLOC_CAP_8BIT));
     if (partial_buffer_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate %u-byte partial capture buffer",
-                 static_cast<unsigned>(required));
+        ESP_LOGE(TAG, "Failed partial buffer %u bytes", static_cast<unsigned>(required));
+        partial_row_bytes_ = 0;
         return false;
     }
     partial_buffer_size_ = required;
     std::memset(partial_buffer_, 0xFF, required);
 
-    capture_area_.x1 = 0;
-    capture_area_.x2 = EPD_WIDTH - 1;
+    capture_area_.x1 = x_start;
+    capture_area_.x2 = x_end - 1;
     capture_area_.y1 = y_start;
     capture_area_.y2 = y_end - 1;
 
@@ -654,28 +904,25 @@ bool EpaperDisplayT42::CaptureUiRegion(int y_start, int y_end) {
     return !stream_error_;
 }
 
-bool EpaperDisplayT42::WriteCapturedPartialRegion(int y_start, int y_end) {
-    if (partial_buffer_ == nullptr || y_start >= y_end) {
-        return false;
-    }
+bool EpaperDisplayT42::WriteCapturedPartialRegion() {
+    if (partial_buffer_ == nullptr || partial_row_bytes_ == 0) return false;
 
-    if (!SetPartialWindow(0, y_start, EPD_WIDTH, y_end)) {
-        return false;
-    }
+    const int x_start = capture_area_.x1;
+    const int y_start = capture_area_.y1;
+    const int x_end = capture_area_.x2 + 1;
+    const int y_end = capture_area_.y2 + 1;
+    if (!SetPartialWindow(x_start, y_start, x_end, y_end)) return false;
 
-    SendCommand(0x13); // current image RAM, matching Waveshare partial example
+    SendCommand(0x13);
     gpio_set_level(EPD_DC_PIN, 1);
     const int rows = y_end - y_start;
     for (int row = 0; row < rows; ++row) {
-        std::memcpy(mono_line_,
-                    partial_buffer_ + static_cast<size_t>(row) * MONO_LINE_BYTES,
-                    MONO_LINE_BYTES);
-        if (SpiWrite(mono_line_, MONO_LINE_BYTES) != ESP_OK) {
-            return false;
-        }
+        const uint8_t* src =
+            partial_buffer_ + static_cast<size_t>(row) * partial_row_bytes_;
+        if (SpiWrite(src, partial_row_bytes_) != ESP_OK) return false;
     }
 
-    SendCommand(0x12); // DISPLAY REFRESH
+    SendCommand(0x12);
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     return WaitBusyRelease("partial-refresh", EPD_BUSY_TIMEOUT_MS);
 }
@@ -684,14 +931,13 @@ void EpaperDisplayT42::ReleasePartialBuffer() {
     if (partial_buffer_ != nullptr) {
         heap_caps_free(partial_buffer_);
         partial_buffer_ = nullptr;
-        partial_buffer_size_ = 0;
     }
+    partial_buffer_size_ = 0;
+    partial_row_bytes_ = 0;
 }
 
 esp_err_t EpaperDisplayT42::SpiWrite(const uint8_t* data, size_t len) {
-    if (spi_ == nullptr || data == nullptr || len == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (spi_ == nullptr || data == nullptr || len == 0) return ESP_ERR_INVALID_ARG;
 
     size_t offset = 0;
     while (offset < len) {
@@ -699,11 +945,8 @@ esp_err_t EpaperDisplayT42::SpiWrite(const uint8_t* data, size_t len) {
         spi_transaction_t t = {};
         t.length = n * 8;
         t.tx_buffer = data + offset;
-
-        esp_err_t err = spi_device_polling_transmit(spi_, &t);
-        if (err != ESP_OK) {
-            return err;
-        }
+        const esp_err_t err = spi_device_polling_transmit(spi_, &t);
+        if (err != ESP_OK) return err;
         offset += n;
     }
     return ESP_OK;
@@ -720,7 +963,6 @@ void EpaperDisplayT42::SendData(uint8_t data) {
 }
 
 void EpaperDisplayT42::HardwareReset() {
-    // Known-good timing on the user's Waveshare Rev2.3 HAT.
     gpio_set_level(EPD_RST_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(EPD_RST_PIN, 0);
@@ -744,79 +986,45 @@ bool EpaperDisplayT42::WaitBusyRelease(const char* reason, uint32_t timeout_ms) 
 }
 
 void EpaperDisplayT42::ConfigurePanelBase() {
-    // GDEY075T7 / UC8179 base sequence from the known-good GxEPD2 path.
-    SendCommand(0x00); // PANEL SETTING
-    SendData(0x1F);
-
-    SendCommand(0x01); // POWER SETTING
-    SendData(0x07);
-    SendData(0x07);
-    SendData(0x3F);
-    SendData(0x3F);
-    SendData(0x09);
-
-    SendCommand(0x06); // BOOSTER SOFT START
-    SendData(0x17);
-    SendData(0x17);
-    SendData(0x28);
-    SendData(0x17);
-
-    SendCommand(0x61); // TRES: 800 x 480
-    SendData(0x03);
-    SendData(0x20);
-    SendData(0x01);
-    SendData(0xE0);
-
-    SendCommand(0x15); // DUSPI disabled
-    SendData(0x00);
-
-    SendCommand(0x50); // VCOM AND DATA INTERVAL
-    SendData(0x29);
-    SendData(0x07);
-
-    SendCommand(0x60); // TCON
-    SendData(0x22);
-
-    SendCommand(0xE3); // PWS
-    SendData(0x22);
+    SendCommand(0x00); SendData(0x1F);
+    SendCommand(0x01);
+    SendData(0x07); SendData(0x07); SendData(0x3F); SendData(0x3F); SendData(0x09);
+    SendCommand(0x06);
+    SendData(0x17); SendData(0x17); SendData(0x28); SendData(0x17);
+    SendCommand(0x61);
+    SendData(0x03); SendData(0x20); SendData(0x01); SendData(0xE0);
+    SendCommand(0x15); SendData(0x00);
+    SendCommand(0x50); SendData(0x29); SendData(0x07);
+    SendCommand(0x60); SendData(0x22);
+    SendCommand(0xE3); SendData(0x22);
 }
 
 bool EpaperDisplayT42::InitPanelFullRefresh() {
     HardwareReset();
     ConfigurePanelBase();
-
-    SendCommand(0x00);
-    SendData(0x1F); // full-update LUT from OTP
-
-    SendCommand(0x04); // POWER ON
+    SendCommand(0x00); SendData(0x1F);
+    SendCommand(0x04);
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     if (!WaitBusyRelease("power-on/full", EPD_BUSY_TIMEOUT_MS)) {
         panel_powered_ = false;
         return false;
     }
-
     panel_powered_ = true;
     return true;
 }
 
 bool EpaperDisplayT42::InitPanelPartialRefresh() {
     HardwareReset();
-    ConfigurePanelBase();
-
-    // Waveshare 7.5 V2 partial-refresh mode, also matching GxEPD2's OTP fast
-    // partial path for GDEY075T7: fixed temperature waveform at 0x6E.
-    SendCommand(0xE0);
-    SendData(0x02);
-    SendCommand(0xE5);
-    SendData(0x6E);
-
-    SendCommand(0x04); // POWER ON
+    SendCommand(0x00);
+    SendData(0x1F);
+    SendCommand(0x04);
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     if (!WaitBusyRelease("power-on/partial", EPD_BUSY_TIMEOUT_MS)) {
         panel_powered_ = false;
         return false;
     }
-
+    SendCommand(0xE0); SendData(0x02);
+    SendCommand(0xE5); SendData(0x6E);
     panel_powered_ = true;
     return true;
 }
@@ -827,23 +1035,17 @@ bool EpaperDisplayT42::SetPartialWindow(
     y_start = std::max(0, y_start);
     x_end = std::min(EPD_WIDTH, x_end);
     y_end = std::min(EPD_HEIGHT, y_end);
-    if (x_start >= x_end || y_start >= y_end) {
-        return false;
-    }
+    if (x_start >= x_end || y_start >= y_end) return false;
 
-    // Reproduce Waveshare's official byte-aligned partial-window convention.
     const int x_start_byte = x_start / 8;
-    const int x_end_byte = (x_end + 7) / 8; // exclusive byte index
+    const int x_end_byte = (x_end + 7) / 8;
     const int panel_x_start = x_start_byte * 8;
     const int panel_x_end = (x_end_byte - 1) * 8;
     const int panel_y_end = y_end - 1;
 
-    SendCommand(0x50);
-    SendData(0xA9);
-    SendData(0x07);
-
-    SendCommand(0x91); // PARTIAL IN
-    SendCommand(0x90); // PARTIAL WINDOW
+    SendCommand(0x50); SendData(0xA9); SendData(0x07);
+    SendCommand(0x91);
+    SendCommand(0x90);
     SendData(static_cast<uint8_t>((panel_x_start >> 8) & 0xFF));
     SendData(static_cast<uint8_t>(panel_x_start & 0xFF));
     SendData(static_cast<uint8_t>((panel_x_end >> 8) & 0xFF));
@@ -857,37 +1059,31 @@ bool EpaperDisplayT42::SetPartialWindow(
 }
 
 bool EpaperDisplayT42::RefreshPanelFull() {
-    ESP_LOGI(TAG, "Full refresh begin (GDEY075T7 current-plane streaming)");
-
+    ESP_LOGI(TAG, "Full refresh begin");
     if (!InitPanelFullRefresh()) {
         SleepPanel();
         return false;
     }
 
-    SendCommand(0x10); // previous image plane
+    SendCommand(0x10);
     if (!StreamSolidPlane(0x00)) {
-        ESP_LOGE(TAG, "Previous plane 0x10 streaming failed");
         SleepPanel();
         return false;
     }
 
-    SendCommand(0x13); // current image plane
+    SendCommand(0x13);
     if (!StreamCurrentUiToPanel()) {
-        ESP_LOGE(TAG, "Current plane 0x13 streaming failed");
         SleepPanel();
         return false;
     }
 
-    SendCommand(0xE0);
-    SendData(0x00);
-    SendCommand(0x41); // internal temperature sensor
-    SendData(0x00);
-    SendCommand(0x12); // DISPLAY REFRESH
+    SendCommand(0xE0); SendData(0x00);
+    SendCommand(0x41); SendData(0x00);
+    SendCommand(0x12);
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
-
     const bool ok = WaitBusyRelease("display-refresh/full", EPD_BUSY_TIMEOUT_MS);
-    SleepPanel();
 
+    SleepPanel();
     if (ok) {
         full_refresh_done_ = true;
         partial_refresh_count_ = 0;
@@ -896,8 +1092,19 @@ bool EpaperDisplayT42::RefreshPanelFull() {
     return ok;
 }
 
+bool EpaperDisplayT42::RefreshPartialRegion(
+    int x_start, int y_start, int x_end, int y_end, const char* name) {
+    ESP_LOGI(TAG, "Partial %s x=%d..%d y=%d..%d",
+             name, x_start, x_end - 1, y_start, y_end - 1);
+    if (!CaptureUiRegion(x_start, y_start, x_end, y_end)) return false;
+    const bool ok = WriteCapturedPartialRegion();
+    ReleasePartialBuffer();
+    return ok;
+}
+
 bool EpaperDisplayT42::RefreshPanelPartial(uint32_t mask) {
-    ESP_LOGI(TAG, "Partial refresh batch begin: mask=0x%08lx", static_cast<unsigned long>(mask));
+    ESP_LOGI(TAG, "Partial batch begin mask=0x%08lx",
+             static_cast<unsigned long>(mask));
 
     if (!InitPanelPartialRefresh()) {
         SleepPanel();
@@ -905,64 +1112,40 @@ bool EpaperDisplayT42::RefreshPanelPartial(uint32_t mask) {
     }
 
     bool ok = true;
-    uint32_t refreshed_regions = 0;
+    uint32_t count = 0;
+    auto refresh_if = [&](uint32_t bit, const Region& r) {
+        if (ok && (mask & bit) != 0) {
+            ok = RefreshPartialRegion(r.x0, r.y0, r.x1, r.y1, r.name);
+            if (ok) ++count;
+        }
+    };
 
-    if ((mask & REFRESH_STATUS) != 0) {
-        ok = RefreshPartialRegion(kStatusY0, kStatusY1, "status");
-        if (ok) ++refreshed_regions;
-    }
-    if (ok && (mask & REFRESH_USER) != 0) {
-        ok = RefreshPartialRegion(kUserY0, kUserY1, "user");
-        if (ok) ++refreshed_regions;
-    }
-    if (ok && (mask & REFRESH_ASSISTANT) != 0) {
-        ok = RefreshPartialRegion(kAssistantY0, kAssistantY1, "assistant");
-        if (ok) ++refreshed_regions;
-    }
+    refresh_if(REFRESH_CLOCK, kClockRegion);
+    refresh_if(REFRESH_HEADER, kHeaderRegion);
+    refresh_if(REFRESH_WEATHER, kWeatherRegion);
+    refresh_if(REFRESH_TODO, kTodoRegion);
+    refresh_if(REFRESH_QUICK, kQuickRegion);
+    refresh_if(REFRESH_WORD, kWordRegion);
+    refresh_if(REFRESH_CHAT, kChatRegion);
 
     ReleasePartialBuffer();
     SleepPanel();
+    if (ok) partial_refresh_count_ += count;
 
-    if (ok) {
-        partial_refresh_count_ += refreshed_regions;
-    }
-
-    ESP_LOGI(TAG, "Partial refresh batch %s, count=%lu/%u",
+    ESP_LOGI(TAG, "Partial batch %s count=%lu/%u",
              ok ? "done" : "failed",
              static_cast<unsigned long>(partial_refresh_count_),
              static_cast<unsigned>(kPartialRefreshLimit));
     return ok;
 }
 
-bool EpaperDisplayT42::RefreshPartialRegion(int y_start, int y_end, const char* name) {
-    ESP_LOGI(TAG, "Partial region %s: x=0..%d y=%d..%d",
-             name, EPD_WIDTH - 1, y_start, y_end - 1);
-
-    if (!CaptureUiRegion(y_start, y_end)) {
-        ESP_LOGE(TAG, "Capture failed for partial region %s", name);
-        return false;
-    }
-
-    const bool ok = WriteCapturedPartialRegion(y_start, y_end);
-    ReleasePartialBuffer();
-    if (!ok) {
-        ESP_LOGE(TAG, "Panel write failed for partial region %s", name);
-    }
-    return ok;
-}
-
 void EpaperDisplayT42::SleepPanel() {
-    if (spi_ == nullptr || !panel_powered_) {
-        return;
-    }
+    if (spi_ == nullptr || !panel_powered_) return;
 
-    // Waveshare official sleep sequence: restore interval, power off, deep sleep.
-    SendCommand(0x50);
-    SendData(0xF7);
+    SendCommand(0x50); SendData(0xF7);
     SendCommand(0x02);
     vTaskDelay(pdMS_TO_TICKS(20));
     WaitBusyRelease("power-off", 3000);
-    SendCommand(0x07);
-    SendData(0xA5);
+    SendCommand(0x07); SendData(0xA5);
     panel_powered_ = false;
 }
