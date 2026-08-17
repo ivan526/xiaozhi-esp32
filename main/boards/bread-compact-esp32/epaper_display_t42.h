@@ -52,6 +52,9 @@ private:
         REFRESH_QUICK   = 1u << 4,
         REFRESH_WORD    = 1u << 5,
         REFRESH_CHAT    = 1u << 6,
+        // Date/lunar only need a larger clock-card refresh when the local day
+        // changes. Normal minute ticks use the much smaller REFRESH_CLOCK area.
+        REFRESH_DATE    = 1u << 7,
         REFRESH_FULL    = 1u << 31,
     };
 
