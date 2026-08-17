@@ -25,20 +25,28 @@ LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 namespace {
 constexpr spi_host_device_t kSpiHost = SPI3_HOST;
 constexpr size_t kSpiChunk = 4096;
-constexpr size_t kMaxUserBytes = 180;
-constexpr size_t kMaxAssistantBytes = 420;
+constexpr size_t kMaxUserBytes = 160;
+constexpr size_t kMaxAssistantBytes = 300;
 constexpr uint32_t kPartialDebounceMs = 220;
 constexpr uint32_t kRefreshTriggerDelayMs = 100;
-constexpr uint32_t kPartialRefreshLimit = 90;
+// Clock refreshes once per minute. Keep a periodic hard clean before ghosting
+// becomes obvious even if the configured full-refresh timer is longer.
+constexpr uint32_t kPartialRefreshLimit = 40;
+
+TaskHandle_t g_clock_task_handle = nullptr;
 
 struct Region { int x0; int y0; int x1; int y1; const char* name; };
-constexpr Region kClockRegion   {0,   0, 336, 136, "clock"};
-constexpr Region kHeaderRegion  {332, 0, 800, 136, "header"};
-constexpr Region kWeatherRegion {0, 132, 348, 304, "weather"};
-constexpr Region kTodoRegion    {344, 132, 534, 304, "todo"};
-constexpr Region kQuickRegion   {530, 132, 800, 304, "quick"};
-constexpr Region kWordRegion    {0, 300, 294, 480, "word"};
-constexpr Region kChatRegion    {290, 300, 800, 480, "chat"};
+// UC8179/GDEY075T7 partial addressing is most reliable when the window starts
+// at X=0. We therefore keep true partial height, but include the pixels to the
+// left of right-side widgets. This is still far faster than a 800x480 full
+// refresh and avoids the non-zero X corruption seen with Waveshare 7.5 V2.
+constexpr Region kClockRegion   {0, 0,   336, 136, "clock"};
+constexpr Region kHeaderRegion  {0, 0,   800, 136, "header"};
+constexpr Region kWeatherRegion {0, 132, 352, 304, "weather"};
+constexpr Region kTodoRegion    {0, 132, 536, 304, "todo"};
+constexpr Region kQuickRegion   {0, 132, 800, 304, "quick"};
+constexpr Region kWordRegion    {0, 300, 296, 480, "word"};
+constexpr Region kChatRegion    {0, 300, 800, 480, "chat"};
 
 constexpr uint8_t kDigitSegments[10] = {
     0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110,
@@ -91,13 +99,17 @@ EpaperDisplayT42::EpaperDisplayT42()
 
     ready_ = true;
     ESP_LOGI(TAG,
-             "Ready: GDEY075T7 800x480 dashboard, true-window partial refresh, "
+             "Ready: GDEY075T7 800x480 dashboard, stable X0 partial refresh, "
              "PWR=3V3 BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
              EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN,
              EPD_CS_PIN, EPD_SCLK_PIN, EPD_MOSI_PIN);
 }
 
 EpaperDisplayT42::~EpaperDisplayT42() {
+    if (g_clock_task_handle != nullptr) {
+        vTaskDelete(g_clock_task_handle);
+        g_clock_task_handle = nullptr;
+    }
     if (data_task_handle_ != nullptr) {
         vTaskDelete(data_task_handle_);
         data_task_handle_ = nullptr;
@@ -225,7 +237,8 @@ lv_obj_t* EpaperDisplayT42::CreateBox(lv_obj_t* screen, int x, int y, int w, int
     lv_obj_t* box = lv_obj_create(screen);
     lv_obj_set_pos(box, x, y);
     lv_obj_set_size(box, w, h);
-    lv_obj_set_style_radius(box, 6, 0);
+    // Small radius + stronger border renders more cleanly on a 1-bit panel.
+    lv_obj_set_style_radius(box, 2, 0);
     lv_obj_set_style_border_width(box, 1, 0);
     lv_obj_set_style_border_color(box, lv_color_black(), 0);
     lv_obj_set_style_bg_color(box, lv_color_white(), 0);
@@ -251,12 +264,12 @@ lv_obj_t* EpaperDisplayT42::CreateLabel(
 }
 
 void EpaperDisplayT42::CreateSevenSegmentClock(lv_obj_t* screen) {
-    constexpr int x0 = 24;
-    constexpr int y0 = 18;
-    constexpr int digit_w = 50;
-    constexpr int digit_h = 72;
-    constexpr int t = 7;
-    constexpr int gap = 8;
+    constexpr int x0 = 22;
+    constexpr int y0 = 14;
+    constexpr int digit_w = 48;
+    constexpr int digit_h = 70;
+    constexpr int t = 6;
+    constexpr int gap = 7;
     const int digit_x[4] = {x0, x0 + digit_w + gap, x0 + 2 * digit_w + 3 * gap,
                             x0 + 3 * digit_w + 4 * gap};
 
@@ -283,8 +296,8 @@ void EpaperDisplayT42::CreateSevenSegmentClock(lv_obj_t* screen) {
     const int colon_x = x0 + 2 * digit_w + 2 * gap;
     for (int i = 0; i < 2; ++i) {
         clock_colon_[i] = lv_obj_create(screen);
-        lv_obj_set_pos(clock_colon_[i], colon_x, y0 + 22 + i * 28);
-        lv_obj_set_size(clock_colon_[i], 8, 8);
+        lv_obj_set_pos(clock_colon_[i], colon_x, y0 + 21 + i * 27);
+        lv_obj_set_size(clock_colon_[i], 7, 7);
         lv_obj_set_style_radius(clock_colon_[i], 4, 0);
         StyleSolidBlack(clock_colon_[i]);
     }
@@ -304,6 +317,8 @@ void EpaperDisplayT42::SetClockDigit(int index, int digit) {
 }
 
 void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
+    // 800x480 fixed grid. Keep 5px outer margin and 5px gutters so every
+    // module remains visually independent after partial updates.
     CreateBox(screen, 5, 5, 326, 126);
     CreateBox(screen, 336, 5, 459, 126);
     CreateBox(screen, 5, 137, 339, 162);
@@ -313,43 +328,42 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     CreateBox(screen, 294, 305, 501, 170);
 
     CreateSevenSegmentClock(screen);
-    date_label_ = CreateLabel(screen, 22, 96, 295, "日期");
-    lunar_label_ = CreateLabel(screen, 22, 113, 295, "农历");
+    date_label_ = CreateLabel(screen, 20, 91, 298, "日期");
+    lunar_label_ = CreateLabel(screen, 20, 111, 298, "农历");
 
-    CreateLabel(screen, 354, 17, 60, "●  ●");
-    CreateLabel(screen, 416, 16, 230, "小智桌面屏");
-    CreateLabel(screen, 676, 18, 105, "USB | WiFi", LV_TEXT_ALIGN_RIGHT);
-    status_label_ = CreateLabel(screen, 416, 48, 350, "已联网 | 正在启动");
-    CreateLabel(screen, 354, 83, 420, "可问：天气 · 日程 · 提醒 · 设备状态");
+    CreateLabel(screen, 354, 18, 260, "小智桌面屏");
+    CreateLabel(screen, 662, 18, 116, "USB · WiFi", LV_TEXT_ALIGN_RIGHT);
+    status_label_ = CreateLabel(screen, 354, 49, 420, "已联网 · 正在启动");
+    CreateLabel(screen, 354, 82, 420, "语音唤醒｜天气 · 日程 · 提醒 · 设备状态");
 
-    weather_title_label_ = CreateLabel(screen, 20, 147, 310, "北京 · 天气");
-    weather_current_label_ = CreateLabel(screen, 20, 175, 310, "今日 多云  28°  30°/24°");
+    weather_title_label_ = CreateLabel(screen, 20, 148, 310, "北京 · 天气");
+    weather_current_label_ = CreateLabel(screen, 20, 174, 310, "今日 多云 28°  30°/24°");
     weather_aqi_label_ = CreateLabel(screen, 20, 198, 310, "AQI 52 优");
     weather_forecast_labels_[0] = CreateLabel(screen, 20, 225, 310, "周二 晴 31°/24°");
     weather_forecast_labels_[1] = CreateLabel(screen, 20, 248, 310, "周三 小雨 28°/23°");
     weather_forecast_labels_[2] = CreateLabel(screen, 20, 271, 310, "周四 阴 27°/22°");
 
-    CreateLabel(screen, 362, 148, 155, "今日待办");
-    todo_labels_[0] = CreateLabel(screen, 362, 176, 156, "");
-    todo_labels_[1] = CreateLabel(screen, 362, 218, 156, "");
-    todo_labels_[2] = CreateLabel(screen, 362, 260, 156, "");
+    CreateLabel(screen, 362, 149, 155, "今日待办");
+    todo_labels_[0] = CreateLabel(screen, 362, 182, 156, "");
+    todo_labels_[1] = CreateLabel(screen, 362, 219, 156, "");
+    todo_labels_[2] = CreateLabel(screen, 362, 256, 156, "");
 
     quick_labels_[0] = CreateLabel(screen, 548, 149, 232, "");
     quick_labels_[1] = CreateLabel(screen, 548, 186, 232, "");
     quick_labels_[2] = CreateLabel(screen, 548, 223, 232, "");
     quick_labels_[3] = CreateLabel(screen, 548, 260, 232, "");
 
-    CreateLabel(screen, 18, 316, 240, "每日记单词");
-    word_label_ = CreateLabel(screen, 18, 340, 250, "abandon");
-    phonetic_label_ = CreateLabel(screen, 18, 361, 250, "/əˈbændən/");
-    meaning_label_ = CreateLabel(screen, 18, 382, 250, "放弃；遗弃");
-    example_label_ = CreateLabel(screen, 18, 405, 255, "例：Don't abandon your plan.\n不要放弃你的计划。");
+    CreateLabel(screen, 18, 316, 250, "每日记单词");
+    word_label_ = CreateLabel(screen, 18, 341, 250, "abandon");
+    phonetic_label_ = CreateLabel(screen, 18, 363, 250, "/əˈbændən/");
+    meaning_label_ = CreateLabel(screen, 18, 385, 250, "放弃；遗弃");
+    example_label_ = CreateLabel(screen, 18, 411, 255, "例：Don't abandon your plan.");
     word_footer_label_ = CreateLabel(screen, 18, 452, 255, "20词 · 30分钟轮播 · 1/20");
 
-    user_label_ = CreateLabel(screen, 310, 318, 468, "你：等待你说话");
-    assistant_label_ = CreateLabel(screen, 310, 357, 468, "小智：准备好了，随时可以聊。");
-    CreateLabel(screen, 310, 447, 468,
-                "说“小智小智”唤醒 | 按键说话 | 天气 · 日程 · 提醒 · 设备");
+    user_label_ = CreateLabel(screen, 310, 319, 468, "你：等待你说话");
+    assistant_label_ = CreateLabel(screen, 310, 352, 468, "小智：准备好了，随时可以聊。");
+    CreateLabel(screen, 310, 450, 468,
+                "说“小智小智”唤醒｜按键说话｜天气 · 日程 · 提醒 · 设备");
 
     UpdateClockLocked(true);
     UpdateHeaderLocked();
@@ -364,21 +378,56 @@ void EpaperDisplayT42::SetupUI() {
     if (setup_ui_called_) return;
 
     Display::SetupUI();
-    DisplayLockGuard lock(this);
-    lv_obj_t* screen = lv_display_get_screen_active(display_);
-    if (screen == nullptr) return;
+    {
+        DisplayLockGuard lock(this);
+        lv_obj_t* screen = lv_display_get_screen_active(display_);
+        if (screen == nullptr) return;
 
-    lv_obj_clean(screen);
-    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(screen, lv_color_black(), 0);
-    lv_obj_set_style_text_font(screen, &BUILTIN_TEXT_FONT, 0);
-    lv_obj_set_style_pad_all(screen, 0, 0);
+        lv_obj_clean(screen);
+        lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_color(screen, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(screen, lv_color_black(), 0);
+        lv_obj_set_style_text_font(screen, &BUILTIN_TEXT_FONT, 0);
+        lv_obj_set_style_pad_all(screen, 0, 0);
 
-    BuildDashboardUi(screen);
+        BuildDashboardUi(screen);
+    }
+
     ESP_LOGI(TAG, "Desk dashboard UI ready");
     NotifyRefresh(REFRESH_FULL);
+
+    // Dedicated local clock task. It is intentionally independent from the
+    // network data task so a slow/unreachable weather endpoint can never stop
+    // the minute clock from updating.
+    if (g_clock_task_handle == nullptr) {
+        if (xTaskCreate(
+                [](void* arg) {
+                    auto* self = static_cast<EpaperDisplayT42*>(arg);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    for (;;) {
+                        const std::time_t now = std::time(nullptr);
+                        struct tm local = {};
+                        if (ValidSystemTime(now, &local)) {
+                            const int minute_key = local.tm_hour * 60 + local.tm_min;
+                            if (minute_key != self->last_clock_minute_ ||
+                                local.tm_yday != self->last_clock_yday_) {
+                                {
+                                    DisplayLockGuard lock(self);
+                                    self->UpdateClockLocked(false);
+                                }
+                                ESP_LOGI(TAG, "Clock tick %02d:%02d", local.tm_hour, local.tm_min);
+                                self->NotifyRefresh(REFRESH_CLOCK);
+                            }
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+                    }
+                },
+                "epaper_clock", 3072, this, 1, &g_clock_task_handle) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create local clock task");
+            g_clock_task_handle = nullptr;
+        }
+    }
 
     if (data_task_handle_ == nullptr) {
         if (xTaskCreate(DataTaskEntry, "epaper_data", 7168, this, 1,
@@ -429,7 +478,7 @@ void EpaperDisplayT42::UpdateClockLocked(bool force) {
 
 void EpaperDisplayT42::UpdateHeaderLocked() {
     if (status_label_ == nullptr) return;
-    std::string status = "已联网 | ";
+    std::string status = "已联网 · ";
     status += status_text_.empty() ? "待唤醒" : status_text_;
     lv_label_set_text(status_label_, status.c_str());
 }
@@ -467,8 +516,9 @@ void EpaperDisplayT42::UpdateTodoLocked() {
     char buf[160];
     for (size_t i = 0; i < todo_labels_.size(); ++i) {
         const auto& item = dashboard_.todos[i];
-        std::snprintf(buf, sizeof(buf), "○ %s %s\n   %s",
-                      item.time.c_str(), item.title.c_str(), item.detail.c_str());
+        // One compact line is much more legible in the narrow 181px card.
+        std::snprintf(buf, sizeof(buf), "%s  %s",
+                      item.time.c_str(), item.title.c_str());
         lv_label_set_text(todo_labels_[i], buf);
     }
 }
@@ -479,7 +529,7 @@ void EpaperDisplayT42::UpdateQuickLocked() {
     };
     char buf[192];
     for (size_t i = 0; i < quick_labels_.size(); ++i) {
-        std::snprintf(buf, sizeof(buf), "%s  %s\n%s",
+        std::snprintf(buf, sizeof(buf), "%s｜%s\n%s",
                       items[i]->title.c_str(), items[i]->line1.c_str(), items[i]->line2.c_str());
         lv_label_set_text(quick_labels_[i], buf);
     }
@@ -492,12 +542,11 @@ void EpaperDisplayT42::UpdateWordLocked() {
     lv_label_set_text(meaning_label_, word.meaning.c_str());
 
     std::string example = "例：" + word.example;
-    if (!word.translation.empty()) example += "\n" + word.translation;
-    example = TruncateUtf8(example, 150);
+    example = TruncateUtf8(example, 90);
     lv_label_set_text(example_label_, example.c_str());
 
     char footer[128];
-    std::snprintf(footer, sizeof(footer), "今日%d词 · %d分钟轮播 · 第%d/%d个",
+    std::snprintf(footer, sizeof(footer), "%d词 · %d分钟轮播 · %d/%d",
                   word.total, data_provider_.config().word_rotate_minutes,
                   word.index, word.total);
     lv_label_set_text(word_footer_label_, footer);
@@ -613,7 +662,7 @@ void EpaperDisplayT42::DataTaskEntry(void* arg) {
 }
 
 void EpaperDisplayT42::DataTaskLoop() {
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    vTaskDelay(pdMS_TO_TICKS(6000));
 
     const auto& cfg = data_provider_.config();
     int64_t now_ms = esp_timer_get_time() / 1000;
@@ -622,20 +671,11 @@ void EpaperDisplayT42::DataTaskLoop() {
     int64_t next_full_ms = now_ms + static_cast<int64_t>(cfg.full_refresh_minutes) * 60000;
 
     for (;;) {
+        // Word rotation is local and cheap. Clock updates are deliberately NOT
+        // handled here because HTTP below may block on a poor network.
         const std::time_t now = std::time(nullptr);
         struct tm local = {};
         if (ValidSystemTime(now, &local)) {
-            const int minute_key = local.tm_hour * 60 + local.tm_min;
-            const bool clock_changed =
-                minute_key != last_clock_minute_ || local.tm_yday != last_clock_yday_;
-            if (clock_changed) {
-                {
-                    DisplayLockGuard lock(this);
-                    UpdateClockLocked(false);
-                }
-                NotifyRefresh(REFRESH_CLOCK);
-            }
-
             const int word_slot =
                 (local.tm_hour * 60 + local.tm_min) / std::max(5, cfg.word_rotate_minutes);
             if (!dashboard_.custom_api_live && word_slot != last_word_slot_) {
@@ -785,7 +825,10 @@ void EpaperDisplayT42::LvglFlushCb(
 
 void EpaperDisplayT42::NotifyRefresh(uint32_t mask) {
     pending_refresh_mask_.fetch_or(mask, std::memory_order_relaxed);
-    if (refresh_task_handle_ != nullptr && !streaming_refresh_) {
+    // Always queue the notification. If a new minute/status arrives while a
+    // physical refresh is running, FreeRTOS keeps the count and the refresh
+    // task processes it immediately afterwards instead of silently losing it.
+    if (refresh_task_handle_ != nullptr) {
         xTaskNotifyGive(refresh_task_handle_);
     }
 }
@@ -911,9 +954,13 @@ bool EpaperDisplayT42::WriteCapturedPartialRegion() {
     const int y_start = capture_area_.y1;
     const int x_end = capture_area_.x2 + 1;
     const int y_end = capture_area_.y2 + 1;
-    if (!SetPartialWindow(x_start, y_start, x_end, y_end)) return false;
 
-    SendCommand(0x13);
+    // Match GxEPD2_750_GDEY075T7: enter partial mode only while writing RAM,
+    // then leave partial mode. For this panel GxEPD2 deliberately does not use
+    // partial-window mode around the actual DISPLAY REFRESH (better image).
+    SendCommand(0x91); // PARTIAL IN
+    if (!SetPartialWindow(x_start, y_start, x_end, y_end)) return false;
+    SendCommand(0x13); // current image RAM
     gpio_set_level(EPD_DC_PIN, 1);
     const int rows = y_end - y_start;
     for (int row = 0; row < rows; ++row) {
@@ -921,8 +968,11 @@ bool EpaperDisplayT42::WriteCapturedPartialRegion() {
             partial_buffer_ + static_cast<size_t>(row) * partial_row_bytes_;
         if (SpiWrite(src, partial_row_bytes_) != ESP_OK) return false;
     }
+    SendCommand(0x92); // PARTIAL OUT
 
-    SendCommand(0x12);
+    // Select the same RAM area for update, without 0x91/0x92 around refresh.
+    if (!SetPartialWindow(x_start, y_start, x_end, y_end)) return false;
+    SendCommand(0x12); // DISPLAY REFRESH
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     return WaitBusyRelease("partial-refresh", EPD_BUSY_TIMEOUT_MS);
 }
@@ -986,6 +1036,7 @@ bool EpaperDisplayT42::WaitBusyRelease(const char* reason, uint32_t timeout_ms) 
 }
 
 void EpaperDisplayT42::ConfigurePanelBase() {
+    // GDEY075T7 / UC8179 base sequence from GxEPD2.
     SendCommand(0x00); SendData(0x1F);
     SendCommand(0x01);
     SendData(0x07); SendData(0x07); SendData(0x3F); SendData(0x3F); SendData(0x09);
@@ -1015,16 +1066,17 @@ bool EpaperDisplayT42::InitPanelFullRefresh() {
 
 bool EpaperDisplayT42::InitPanelPartialRefresh() {
     HardwareReset();
-    SendCommand(0x00);
-    SendData(0x1F);
-    SendCommand(0x04);
+    // Important: every batch starts after deep sleep, so the full controller
+    // base configuration must be restored before selecting the partial LUT.
+    ConfigurePanelBase();
+    SendCommand(0xE0); SendData(0x02); // TSFIX
+    SendCommand(0xE5); SendData(0x6E); // fixed partial temperature waveform
+    SendCommand(0x04); // POWER ON
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     if (!WaitBusyRelease("power-on/partial", EPD_BUSY_TIMEOUT_MS)) {
         panel_powered_ = false;
         return false;
     }
-    SendCommand(0xE0); SendData(0x02);
-    SendCommand(0xE5); SendData(0x6E);
     panel_powered_ = true;
     return true;
 }
@@ -1037,15 +1089,16 @@ bool EpaperDisplayT42::SetPartialWindow(
     y_end = std::min(EPD_HEIGHT, y_end);
     if (x_start >= x_end || y_start >= y_end) return false;
 
-    const int x_start_byte = x_start / 8;
-    const int x_end_byte = (x_end + 7) / 8;
-    const int panel_x_start = x_start_byte * 8;
-    const int panel_x_end = (x_end_byte - 1) * 8;
+    // UC8179 expects inclusive pixel coordinates. The previous implementation
+    // accidentally sent the first pixel of the final byte as X-end (e.g. 328)
+    // while transmitting the complete byte through pixel 335. That row-length
+    // mismatch caused RAM wrapping and the large garbage/ghost blocks seen on
+    // the physical panel.
+    const int panel_x_start = x_start & ~7;
+    const int panel_x_end = (x_end - 1) | 0x07;
     const int panel_y_end = y_end - 1;
 
-    SendCommand(0x50); SendData(0xA9); SendData(0x07);
-    SendCommand(0x91);
-    SendCommand(0x90);
+    SendCommand(0x90); // PARTIAL WINDOW / RAM area
     SendData(static_cast<uint8_t>((panel_x_start >> 8) & 0xFF));
     SendData(static_cast<uint8_t>(panel_x_start & 0xFF));
     SendData(static_cast<uint8_t>((panel_x_end >> 8) & 0xFF));
@@ -1077,8 +1130,9 @@ bool EpaperDisplayT42::RefreshPanelFull() {
         return false;
     }
 
-    SendCommand(0xE0); SendData(0x00);
-    SendCommand(0x41); SendData(0x00);
+    // GDEY075T7 supports the fast full-refresh OTP waveform (~1.2s typical).
+    SendCommand(0xE0); SendData(0x02);
+    SendCommand(0xE5); SendData(0x5A);
     SendCommand(0x12);
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     const bool ok = WaitBusyRelease("display-refresh/full", EPD_BUSY_TIMEOUT_MS);
