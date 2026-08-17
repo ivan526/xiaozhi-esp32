@@ -58,10 +58,17 @@ struct DashboardSnapshot {
 };
 
 struct DashboardConfig {
+    // city/lat/lon are the safe fallback and can still be overridden through
+    // NVS. When auto_location is enabled, weather first resolves the device's
+    // approximate network location from its public IP.
     std::string city = "北京";
     std::string latitude = "39.9042";
     std::string longitude = "116.4074";
     std::string timezone = "CST-8";
+    bool auto_location = true;
+    std::string geolocation_url =
+        "https://ipwho.is/?fields=success,city,latitude,longitude,country_code&lang=zh-CN";
+
     std::string custom_api_url;
     std::string custom_api_token;
     int weather_refresh_minutes = 30;
@@ -82,12 +89,22 @@ public:
     bool FetchCustomDashboard(DashboardSnapshot& in_out) const;
 
     static const char* WeatherText(int code);
+    static const char* WeatherGlyph(int code);
     static std::string AqiGrade(int aqi);
 
 private:
     DashboardConfig config_;
 
+    // Runtime location cache. IP geolocation is approximate but lets a device
+    // without GPS follow the city of the network it is currently using. The
+    // configured Beijing coordinates remain the fallback if lookup is blocked.
+    mutable std::string active_city_;
+    mutable std::string active_latitude_;
+    mutable std::string active_longitude_;
+    mutable std::time_t next_location_refresh_ = 0;
+
     bool HttpGet(const std::string& url, std::string& body, bool use_custom_token) const;
+    bool ResolveCurrentLocation() const;
 };
 
 }  // namespace epaper_dashboard
