@@ -34,7 +34,13 @@ public:
     void SetPowerSaveMode(bool on) override;
 
 private:
-    static constexpr int LVGL_BUFFER_ROWS = 4;
+    // Classic ESP32 has tight internal SRAM and the Opus decoder is created
+    // after display SetupUI(). Keep only a single RGB565 scanline here so the
+    // display does not starve esp_opus_dec_open() of contiguous internal heap.
+    // E-paper refresh latency is dominated by the panel waveform, so reducing
+    // this from 4 rows to 1 has negligible visible impact while returning
+    // roughly 4.8 KB of internal RAM to the audio stack.
+    static constexpr int LVGL_BUFFER_ROWS = 1;
     static constexpr size_t MONO_LINE_BYTES = EPD_WIDTH / 8;
 
     enum RefreshMask : uint32_t {
