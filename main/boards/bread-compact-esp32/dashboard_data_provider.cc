@@ -80,7 +80,13 @@ DashboardDataProvider::DashboardDataProvider() {
     config_.city = settings.GetString("city", "北京");
     config_.latitude = settings.GetString("lat", "39.9042");
     config_.longitude = settings.GetString("lon", "116.4074");
+    // China-only board profile. Keep the setting for backward compatibility,
+    // but display code forces CST-8 so local calendar is always UTC+8.
     config_.timezone = settings.GetString("tz", "CST-8");
+    config_.auto_location = settings.GetInt("auto_loc", 1) != 0;
+    config_.geolocation_url = settings.GetString(
+        "geo_url",
+        "https://ipwho.is/?fields=success,city,latitude,longitude,country_code&lang=zh-CN");
     config_.custom_api_url = settings.GetString("api_url", "");
     config_.custom_api_token = settings.GetString("api_token", "");
     config_.weather_refresh_minutes = ClampMinutes(settings.GetInt("weather_min", 30), 30, 5, 240);
@@ -88,8 +94,14 @@ DashboardDataProvider::DashboardDataProvider() {
     config_.word_rotate_minutes = ClampMinutes(settings.GetInt("word_min", 30), 30, 5, 180);
     config_.full_refresh_minutes = ClampMinutes(settings.GetInt("full_min", 60), 60, 15, 360);
 
-    ESP_LOGI(TAG, "config city=%s lat=%s lon=%s weather=%dmin api=%s full=%dmin",
+    active_city_ = config_.city;
+    active_latitude_ = config_.latitude;
+    active_longitude_ = config_.longitude;
+
+    ESP_LOGI(TAG,
+             "config fallback=%s(%s,%s) auto_location=%s weather=%dmin api=%s full=%dmin",
              config_.city.c_str(), config_.latitude.c_str(), config_.longitude.c_str(),
+             config_.auto_location ? "on" : "off",
              config_.weather_refresh_minutes,
              config_.custom_api_url.empty() ? "static" : "configured",
              config_.full_refresh_minutes);
@@ -150,7 +162,7 @@ bool DashboardDataProvider::HttpGet(const std::string& url, std::string& body, b
     auto http = network->CreateHttp(0);
     if (!http) return false;
     http->SetHeader("Accept", "application/json");
-    http->SetHeader("User-Agent", "xiaozhi-epaper-dashboard/1.0");
+    http->SetHeader("User-Agent", "xiaozhi-epaper-dashboard/1.1");
     if (use_custom_token && !config_.custom_api_token.empty()) {
         http->SetHeader("Authorization", "Bearer " + config_.custom_api_token);
     }
@@ -170,14 +182,74 @@ bool DashboardDataProvider::HttpGet(const std::string& url, std::string& body, b
     return !body.empty();
 }
 
+bool DashboardDataProvider::ResolveCurrentLocation() const {
+    if (!config_.auto_location) return true;
+
+    const std::time_t now = std::time(nullptr);
+    if (next_location_refresh_ > 0 && now > 0 && now < next_location_refresh_) {
+        return true;
+    }
+
+    std::string body;
+    if (!HttpGet(config_.geolocation_url, body, false)) {
+        next_location_refresh_ = now > 0 ? now + 600 : 0;
+        ESP_LOGW(TAG, "IP location lookup failed; keep fallback/cached %s", active_city_.c_str());
+        return false;
+    }
+
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) {
+        next_location_refresh_ = now > 0 ? now + 600 : 0;
+        return false;
+    }
+
+    cJSON* success = cJSON_GetObjectItemCaseSensitive(root, "success");
+    cJSON* latitude = cJSON_GetObjectItemCaseSensitive(root, "latitude");
+    cJSON* longitude = cJSON_GetObjectItemCaseSensitive(root, "longitude");
+    cJSON* city = cJSON_GetObjectItemCaseSensitive(root, "city");
+
+    const bool ok = cJSON_IsTrue(success) && cJSON_IsNumber(latitude) && cJSON_IsNumber(longitude);
+    if (ok) {
+        char lat[24];
+        char lon[24];
+        std::snprintf(lat, sizeof(lat), "%.6f", latitude->valuedouble);
+        std::snprintf(lon, sizeof(lon), "%.6f", longitude->valuedouble);
+        active_latitude_ = lat;
+        active_longitude_ = lon;
+        if (cJSON_IsString(city) && city->valuestring != nullptr && city->valuestring[0] != '\0') {
+            active_city_ = city->valuestring;
+        }
+        // Public-IP location changes far less often than weather; six hours
+        // avoids needless network traffic while still following a moved device.
+        next_location_refresh_ = now > 0 ? now + 6 * 3600 : 0;
+        ESP_LOGI(TAG, "auto location %s (%s,%s)",
+                 active_city_.c_str(), active_latitude_.c_str(), active_longitude_.c_str());
+    } else {
+        next_location_refresh_ = now > 0 ? now + 600 : 0;
+        ESP_LOGW(TAG, "IP location response invalid; keep %s", active_city_.c_str());
+    }
+
+    cJSON_Delete(root);
+    return ok;
+}
+
 bool DashboardDataProvider::FetchWeather(WeatherSnapshot& out) const {
+    // ESP32 has no GPS on this board. Approximate the device location from its
+    // current public IP and fall back to the configured coordinates when the
+    // geolocation service is unavailable.
+    ResolveCurrentLocation();
+
+    const std::string& latitude = active_latitude_.empty() ? config_.latitude : active_latitude_;
+    const std::string& longitude = active_longitude_.empty() ? config_.longitude : active_longitude_;
+    const std::string& city = active_city_.empty() ? config_.city : active_city_;
+
     char url[640];
     std::snprintf(url, sizeof(url),
         "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
         "&current=temperature_2m,weather_code"
         "&daily=weather_code,temperature_2m_max,temperature_2m_min"
         "&forecast_days=4&timezone=Asia%%2FShanghai",
-        config_.latitude.c_str(), config_.longitude.c_str());
+        latitude.c_str(), longitude.c_str());
 
     std::string body;
     if (!HttpGet(url, body, false)) return false;
@@ -212,7 +284,7 @@ bool DashboardDataProvider::FetchWeather(WeatherSnapshot& out) const {
     std::snprintf(url, sizeof(url),
         "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=%s&longitude=%s"
         "&current=us_aqi&timezone=Asia%%2FShanghai",
-        config_.latitude.c_str(), config_.longitude.c_str());
+        latitude.c_str(), longitude.c_str());
     std::string aqi_body;
     if (HttpGet(url, aqi_body, false)) {
         cJSON* aqi_root = cJSON_Parse(aqi_body.c_str());
@@ -227,18 +299,19 @@ bool DashboardDataProvider::FetchWeather(WeatherSnapshot& out) const {
         }
     }
 
-    out.city = config_.city;
+    out.city = city;
     out.live = true;
-    std::time_t now = std::time(nullptr);
+    std::time_t updated_now = std::time(nullptr);
     struct tm local = {};
-    if (now > 0 && localtime_r(&now, &local) != nullptr) {
+    if (updated_now > 0 && localtime_r(&updated_now, &local) != nullptr) {
         char updated[16];
         std::snprintf(updated, sizeof(updated), "%02d:%02d", local.tm_hour, local.tm_min);
         out.updated = updated;
     } else {
         out.updated = "在线";
     }
-    ESP_LOGI(TAG, "weather updated %s %dC aqi=%d", out.city.c_str(), out.current_temp, out.aqi);
+    ESP_LOGI(TAG, "weather updated %s (%s,%s) %dC aqi=%d",
+             out.city.c_str(), latitude.c_str(), longitude.c_str(), out.current_temp, out.aqi);
     return true;
 }
 
@@ -294,6 +367,23 @@ const char* DashboardDataProvider::WeatherText(int code) {
         case 71: case 73: case 75: case 77: case 85: case 86: return "雪";
         case 95: case 96: case 99: return "雷雨";
         default: return "多云";
+    }
+}
+
+const char* DashboardDataProvider::WeatherGlyph(int code) {
+    // One-character glyphs are deliberately used instead of bitmap assets: the
+    // Chinese font already contains them, so we get icon-like weather badges
+    // with essentially no extra image RAM.
+    switch (code) {
+        case 0: return "晴";
+        case 45: case 48: return "雾";
+        case 51: case 53: case 55:
+        case 56: case 57: case 61: case 63: case 65:
+        case 66: case 67: case 80: case 81: case 82: return "雨";
+        case 71: case 73: case 75: case 77: case 85: case 86: return "雪";
+        case 95: case 96: case 99: return "雷";
+        case 3: return "阴";
+        default: return "云";
     }
 }
 
