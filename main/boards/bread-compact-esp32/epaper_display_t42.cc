@@ -29,24 +29,24 @@ constexpr size_t kMaxUserBytes = 160;
 constexpr size_t kMaxAssistantBytes = 300;
 constexpr uint32_t kPartialDebounceMs = 220;
 constexpr uint32_t kRefreshTriggerDelayMs = 100;
-// Clock refreshes once per minute. Keep a periodic hard clean before ghosting
-// becomes obvious even if the configured full-refresh timer is longer.
-constexpr uint32_t kPartialRefreshLimit = 40;
-
-TaskHandle_t g_clock_task_handle = nullptr;
+// With one minute clock updates, 32 successful differential refreshes means a
+// clean full refresh roughly every half hour. This keeps text/borders crisp.
+constexpr uint32_t kPartialRefreshLimit = 32;
+// POSIX TZ signs are reversed: CST-8 means UTC+8.
+constexpr char kChinaTimezone[] = "CST-8";
 
 struct Region { int x0; int y0; int x1; int y1; const char* name; };
-// UC8179/GDEY075T7 partial addressing is most reliable when the window starts
-// at X=0. We therefore keep true partial height, but include the pixels to the
-// left of right-side widgets. This is still far faster than a 800x480 full
-// refresh and avoids the non-zero X corruption seen with Waveshare 7.5 V2.
-constexpr Region kClockRegion   {0, 0,   336, 136, "clock"};
-constexpr Region kHeaderRegion  {0, 0,   800, 136, "header"};
-constexpr Region kWeatherRegion {0, 132, 352, 304, "weather"};
-constexpr Region kTodoRegion    {0, 132, 536, 304, "todo"};
-constexpr Region kQuickRegion   {0, 132, 800, 304, "quick"};
-constexpr Region kWordRegion    {0, 300, 296, 480, "word"};
-constexpr Region kChatRegion    {0, 300, 800, 480, "chat"};
+// This physical GDEY075T7 setup is most stable with partial RAM windows starting
+// at X=0. Keep regions narrow in height, and group updates by top/middle/bottom
+// bands so each waveform is useful without allocating a giant 48 KB buffer.
+constexpr Region kClockDigitsRegion {0, 0,   264, 90,  "clock-digits"};
+constexpr Region kClockCardRegion   {0, 0,   336, 136, "clock-card"};
+constexpr Region kHeaderRegion      {0, 0,   800, 136, "header"};
+constexpr Region kWeatherRegion     {0, 132, 352, 304, "weather"};
+constexpr Region kTodoRegion        {0, 132, 536, 304, "todo"};
+constexpr Region kQuickRegion       {0, 132, 800, 304, "quick"};
+constexpr Region kWordRegion        {0, 300, 296, 480, "word"};
+constexpr Region kChatRegion        {0, 300, 800, 480, "chat"};
 
 constexpr uint8_t kDigitSegments[10] = {
     0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110,
@@ -56,6 +56,16 @@ constexpr uint8_t kDigitSegments[10] = {
 bool ValidSystemTime(std::time_t now, struct tm* out) {
     if (now <= 0 || out == nullptr || localtime_r(&now, out) == nullptr) return false;
     return out->tm_year + 1900 >= 2024;
+}
+
+// The dashboard is monochrome. This division-free RGB565 luminance estimate is
+// much cheaper than expanding each channel to 0..255 for every rendered pixel.
+inline bool PixelIsBlack(uint16_t p) {
+    const uint32_t r6 = ((p >> 11) & 0x1F) << 1;
+    const uint32_t g6 = (p >> 5) & 0x3F;
+    const uint32_t b6 = (p & 0x1F) << 1;
+    const uint32_t luminance = r6 * 19 + g6 * 38 + b6 * 7; // weights sum to 64
+    return luminance < (32u * 64u);
 }
 
 void StyleSolidBlack(lv_obj_t* obj) {
@@ -73,10 +83,12 @@ EpaperDisplayT42::EpaperDisplayT42()
     dashboard_ = {};
     data_provider_.FillStaticDefaults(dashboard_);
 
-    const auto& cfg = data_provider_.config();
-    setenv("TZ", cfg.timezone.c_str(), 1);
+    // The board variant is intended for China desktop use. NTP/server time is
+    // still stored as UTC; localtime_r() is always converted to UTC+8 here.
+    setenv("TZ", kChinaTimezone, 1);
     tzset();
 
+    ESP_LOGI(TAG, "Timezone: China Standard Time (UTC+8 / Asia/Shanghai)");
     ESP_LOGI(TAG, "Heap before e-paper: free=%u largest=%u",
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
@@ -86,7 +98,9 @@ EpaperDisplayT42::EpaperDisplayT42()
         return;
     }
 
-    if (xTaskCreate(RefreshTaskEntry, "epaper_refresh", 4096, this, 2,
+    // Audio/Opus is more time-sensitive than e-paper. Keep the display worker at
+    // low priority so a panel update cannot steal scheduling time from playback.
+    if (xTaskCreate(RefreshTaskEntry, "epaper_refresh", 4096, this, 1,
                     &refresh_task_handle_) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create e-paper refresh task");
         return;
@@ -99,17 +113,13 @@ EpaperDisplayT42::EpaperDisplayT42()
 
     ready_ = true;
     ESP_LOGI(TAG,
-             "Ready: GDEY075T7 800x480 dashboard, stable X0 partial refresh, "
+             "Ready: GDEY075T7 800x480 dashboard, banded X0 partial refresh, "
              "PWR=3V3 BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
              EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN,
              EPD_CS_PIN, EPD_SCLK_PIN, EPD_MOSI_PIN);
 }
 
 EpaperDisplayT42::~EpaperDisplayT42() {
-    if (g_clock_task_handle != nullptr) {
-        vTaskDelete(g_clock_task_handle);
-        g_clock_task_handle = nullptr;
-    }
     if (data_task_handle_ != nullptr) {
         vTaskDelete(data_task_handle_);
         data_task_handle_ = nullptr;
@@ -200,7 +210,7 @@ bool EpaperDisplayT42::InitializeLvgl() {
     lv_init();
 
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    port_cfg.task_priority = 2;
+    port_cfg.task_priority = 1;
     port_cfg.timer_period_ms = 50;
     esp_err_t err = lvgl_port_init(&port_cfg);
     if (err != ESP_OK) {
@@ -237,7 +247,6 @@ lv_obj_t* EpaperDisplayT42::CreateBox(lv_obj_t* screen, int x, int y, int w, int
     lv_obj_t* box = lv_obj_create(screen);
     lv_obj_set_pos(box, x, y);
     lv_obj_set_size(box, w, h);
-    // Small radius + stronger border renders more cleanly on a 1-bit panel.
     lv_obj_set_style_radius(box, 2, 0);
     lv_obj_set_style_border_width(box, 1, 0);
     lv_obj_set_style_border_color(box, lv_color_black(), 0);
@@ -260,6 +269,43 @@ lv_obj_t* EpaperDisplayT42::CreateLabel(
     lv_obj_set_style_text_align(label, align, 0);
     lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(label, 0, 0);
+    return label;
+}
+
+lv_obj_t* EpaperDisplayT42::CreateSymbolLabel(
+    lv_obj_t* screen, int x, int y, int w, const char* symbol, lv_text_align_t align) {
+    lv_obj_t* label = lv_label_create(screen);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_width(label, w);
+    lv_label_set_text(label, symbol != nullptr ? symbol : "");
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
+    // FontAwesome symbols are included in LVGL's default built-in font.
+    lv_obj_set_style_text_font(label, LV_FONT_DEFAULT, 0);
+    lv_obj_set_style_text_align(label, align, 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(label, 0, 0);
+    return label;
+}
+
+lv_obj_t* EpaperDisplayT42::CreateWeatherBadge(
+    lv_obj_t* screen, int x, int y, int size, const char* glyph) {
+    lv_obj_t* badge = lv_obj_create(screen);
+    lv_obj_set_pos(badge, x, y);
+    lv_obj_set_size(badge, size, size);
+    lv_obj_set_style_radius(badge, size / 2, 0);
+    lv_obj_set_style_border_width(badge, 2, 0);
+    lv_obj_set_style_border_color(badge, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(badge, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(badge, 0, 0);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* label = lv_label_create(badge);
+    lv_label_set_text(label, glyph != nullptr ? glyph : "云");
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
+    lv_obj_set_style_text_font(label, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
+    lv_obj_center(label);
     return label;
 }
 
@@ -317,8 +363,8 @@ void EpaperDisplayT42::SetClockDigit(int index, int digit) {
 }
 
 void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
-    // 800x480 fixed grid. Keep 5px outer margin and 5px gutters so every
-    // module remains visually independent after partial updates.
+    // 800x480 fixed grid with clear dashboard cards, inspired by practical
+    // information displays rather than a phone/tablet touch interface.
     CreateBox(screen, 5, 5, 326, 126);
     CreateBox(screen, 336, 5, 459, 126);
     CreateBox(screen, 5, 137, 339, 162);
@@ -327,42 +373,66 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     CreateBox(screen, 5, 305, 284, 170);
     CreateBox(screen, 294, 305, 501, 170);
 
+    // Clock / local calendar.
     CreateSevenSegmentClock(screen);
     date_label_ = CreateLabel(screen, 20, 91, 298, "日期");
     lunar_label_ = CreateLabel(screen, 20, 111, 298, "农历");
 
-    CreateLabel(screen, 354, 18, 260, "小智桌面屏");
-    CreateLabel(screen, 662, 18, 116, "USB · WiFi", LV_TEXT_ALIGN_RIGHT);
+    // Xiaozhi header with real monochrome pictograms from LVGL symbols.
+    CreateSymbolLabel(screen, 354, 18, 20, LV_SYMBOL_AUDIO);
+    CreateLabel(screen, 380, 18, 245, "小智桌面屏");
+    CreateSymbolLabel(screen, 704, 18, 24, LV_SYMBOL_WIFI, LV_TEXT_ALIGN_CENTER);
+    CreateSymbolLabel(screen, 742, 18, 24, LV_SYMBOL_USB, LV_TEXT_ALIGN_CENTER);
     status_label_ = CreateLabel(screen, 354, 49, 420, "已联网 · 正在启动");
-    CreateLabel(screen, 354, 82, 420, "语音唤醒｜天气 · 日程 · 提醒 · 设备状态");
+    CreateSymbolLabel(screen, 354, 82, 20, LV_SYMBOL_BELL);
+    CreateLabel(screen, 380, 82, 390, "语音唤醒｜天气 · 日程 · 提醒 · 设备状态");
 
-    weather_title_label_ = CreateLabel(screen, 20, 148, 310, "北京 · 天气");
-    weather_current_label_ = CreateLabel(screen, 20, 174, 310, "今日 多云 28°  30°/24°");
-    weather_aqi_label_ = CreateLabel(screen, 20, 198, 310, "AQI 52 优");
-    weather_forecast_labels_[0] = CreateLabel(screen, 20, 225, 310, "周二 晴 31°/24°");
-    weather_forecast_labels_[1] = CreateLabel(screen, 20, 248, 310, "周三 小雨 28°/23°");
-    weather_forecast_labels_[2] = CreateLabel(screen, 20, 271, 310, "周四 阴 27°/22°");
+    // Weather: graphical badge row similar to a compact e-paper forecast.
+    CreateSymbolLabel(screen, 18, 148, 20, LV_SYMBOL_GPS);
+    weather_title_label_ = CreateLabel(screen, 43, 148, 285, "当前位置 · 天气");
+    const int badge_x[4] = {30, 108, 186, 264};
+    for (int i = 0; i < 4; ++i) {
+        weather_icon_labels_[i] = CreateWeatherBadge(screen, badge_x[i], 174, 34, "云");
+    }
+    weather_current_label_ = CreateLabel(screen, 10, 214, 74, "28° 多云", LV_TEXT_ALIGN_CENTER);
+    weather_aqi_label_ = CreateLabel(screen, 10, 263, 74, "AQI 52优", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[0] = CreateLabel(screen, 87, 214, 75, "周二\n31°/24°", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[1] = CreateLabel(screen, 165, 214, 75, "周三\n28°/23°", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[2] = CreateLabel(screen, 243, 214, 82, "周四\n27°/22°", LV_TEXT_ALIGN_CENTER);
 
-    CreateLabel(screen, 362, 149, 155, "今日待办");
+    // Todos.
+    CreateSymbolLabel(screen, 362, 149, 20, LV_SYMBOL_BELL);
+    CreateLabel(screen, 386, 149, 132, "今日待办");
     todo_labels_[0] = CreateLabel(screen, 362, 182, 156, "");
     todo_labels_[1] = CreateLabel(screen, 362, 219, 156, "");
     todo_labels_[2] = CreateLabel(screen, 362, 256, 156, "");
 
-    quick_labels_[0] = CreateLabel(screen, 548, 149, 232, "");
-    quick_labels_[1] = CreateLabel(screen, 548, 186, 232, "");
-    quick_labels_[2] = CreateLabel(screen, 548, 223, 232, "");
-    quick_labels_[3] = CreateLabel(screen, 548, 260, 232, "");
+    // Connected information placeholders: graphical category icons now, API
+    // values later. These FontAwesome glyphs live in flash, not image buffers.
+    CreateSymbolLabel(screen, 548, 149, 20, LV_SYMBOL_DRIVE);
+    CreateSymbolLabel(screen, 548, 186, 20, LV_SYMBOL_ENVELOPE);
+    CreateSymbolLabel(screen, 548, 223, 20, LV_SYMBOL_HOME);
+    CreateSymbolLabel(screen, 548, 260, 20, LV_SYMBOL_BARS);
+    quick_labels_[0] = CreateLabel(screen, 574, 149, 205, "");
+    quick_labels_[1] = CreateLabel(screen, 574, 186, 205, "");
+    quick_labels_[2] = CreateLabel(screen, 574, 223, 205, "");
+    quick_labels_[3] = CreateLabel(screen, 574, 260, 205, "");
 
-    CreateLabel(screen, 18, 316, 250, "每日记单词");
+    // Word card.
+    CreateSymbolLabel(screen, 18, 316, 20, LV_SYMBOL_EDIT);
+    CreateLabel(screen, 42, 316, 226, "每日记单词");
     word_label_ = CreateLabel(screen, 18, 341, 250, "abandon");
     phonetic_label_ = CreateLabel(screen, 18, 363, 250, "/əˈbændən/");
     meaning_label_ = CreateLabel(screen, 18, 385, 250, "放弃；遗弃");
     example_label_ = CreateLabel(screen, 18, 411, 255, "例：Don't abandon your plan.");
     word_footer_label_ = CreateLabel(screen, 18, 452, 255, "20词 · 30分钟轮播 · 1/20");
 
+    // Conversation card: no touch semantics; physical button + voice wake only.
     user_label_ = CreateLabel(screen, 310, 319, 468, "你：等待你说话");
-    assistant_label_ = CreateLabel(screen, 310, 352, 468, "小智：准备好了，随时可以聊。");
-    CreateLabel(screen, 310, 450, 468,
+    CreateSymbolLabel(screen, 310, 352, 20, LV_SYMBOL_AUDIO);
+    assistant_label_ = CreateLabel(screen, 334, 352, 444, "小智：准备好了，随时可以聊。");
+    CreateSymbolLabel(screen, 310, 450, 20, LV_SYMBOL_AUDIO);
+    CreateLabel(screen, 334, 450, 444,
                 "说“小智小智”唤醒｜按键说话｜天气 · 日程 · 提醒 · 设备");
 
     UpdateClockLocked(true);
@@ -397,38 +467,8 @@ void EpaperDisplayT42::SetupUI() {
     ESP_LOGI(TAG, "Desk dashboard UI ready");
     NotifyRefresh(REFRESH_FULL);
 
-    // Dedicated local clock task. It is intentionally independent from the
-    // network data task so a slow/unreachable weather endpoint can never stop
-    // the minute clock from updating.
-    if (g_clock_task_handle == nullptr) {
-        if (xTaskCreate(
-                [](void* arg) {
-                    auto* self = static_cast<EpaperDisplayT42*>(arg);
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    for (;;) {
-                        const std::time_t now = std::time(nullptr);
-                        struct tm local = {};
-                        if (ValidSystemTime(now, &local)) {
-                            const int minute_key = local.tm_hour * 60 + local.tm_min;
-                            if (minute_key != self->last_clock_minute_ ||
-                                local.tm_yday != self->last_clock_yday_) {
-                                {
-                                    DisplayLockGuard lock(self);
-                                    self->UpdateClockLocked(false);
-                                }
-                                ESP_LOGI(TAG, "Clock tick %02d:%02d", local.tm_hour, local.tm_min);
-                                self->NotifyRefresh(REFRESH_CLOCK);
-                            }
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(1000));
-                    }
-                },
-                "epaper_clock", 3072, this, 1, &g_clock_task_handle) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to create local clock task");
-            g_clock_task_handle = nullptr;
-        }
-    }
-
+    // Reuse Application's existing 1-second clock event instead of allocating
+    // another FreeRTOS task. This returns ~3 KB internal RAM to Opus/audio.
     if (data_task_handle_ == nullptr) {
         if (xTaskCreate(DataTaskEntry, "epaper_data", 7168, this, 1,
                         &data_task_handle_) != pdPASS) {
@@ -448,7 +488,7 @@ void EpaperDisplayT42::UpdateClockLocked(bool force) {
     struct tm local = {};
     if (!ValidSystemTime(now, &local)) {
         if (force) {
-            if (date_label_ != nullptr) lv_label_set_text(date_label_, "等待时间同步 · 北京");
+            if (date_label_ != nullptr) lv_label_set_text(date_label_, "等待时间同步 · 中国时区");
             if (lunar_label_ != nullptr) lv_label_set_text(lunar_label_, "农历日期");
         }
         return;
@@ -465,7 +505,8 @@ void EpaperDisplayT42::UpdateClockLocked(bool force) {
     char date[96];
     std::snprintf(date, sizeof(date), "%d月%d日 %s · %s",
                   local.tm_mon + 1, local.tm_mday, WeekdayName(local.tm_wday),
-                  data_provider_.config().city.c_str());
+                  dashboard_.weather.city.empty() ? data_provider_.config().city.c_str()
+                                                  : dashboard_.weather.city.c_str());
     if (date_label_ != nullptr) lv_label_set_text(date_label_, date);
 
     const std::string lunar = epaper_dashboard::FormatLunarDate(
@@ -487,15 +528,23 @@ void EpaperDisplayT42::UpdateWeatherLocked() {
     char buf[192];
     const auto& w = dashboard_.weather;
     std::snprintf(buf, sizeof(buf), "%s · %s %s",
-                  w.city.c_str(), w.live ? "更新" : "静态", w.updated.c_str());
+                  w.city.c_str(), w.live ? "定位天气" : "静态", w.updated.c_str());
     lv_label_set_text(weather_title_label_, buf);
 
-    std::snprintf(buf, sizeof(buf), "今日 %s  %d°  %d°/%d°",
-                  epaper_dashboard::DashboardDataProvider::WeatherText(w.current_code),
-                  w.current_temp, w.days[0].temp_max, w.days[0].temp_min);
+    lv_label_set_text(weather_icon_labels_[0],
+                      epaper_dashboard::DashboardDataProvider::WeatherGlyph(w.current_code));
+    for (int i = 0; i < 3; ++i) {
+        lv_label_set_text(weather_icon_labels_[i + 1],
+                          epaper_dashboard::DashboardDataProvider::WeatherGlyph(
+                              w.days[i + 1].weather_code));
+    }
+
+    std::snprintf(buf, sizeof(buf), "%d° %s",
+                  w.current_temp,
+                  epaper_dashboard::DashboardDataProvider::WeatherText(w.current_code));
     lv_label_set_text(weather_current_label_, buf);
 
-    std::snprintf(buf, sizeof(buf), "AQI %d %s", w.aqi, w.aqi_grade.c_str());
+    std::snprintf(buf, sizeof(buf), "AQI %d%s", w.aqi, w.aqi_grade.c_str());
     lv_label_set_text(weather_aqi_label_, buf);
 
     std::time_t now = std::time(nullptr);
@@ -504,10 +553,8 @@ void EpaperDisplayT42::UpdateWeatherLocked() {
     for (int i = 0; i < 3; ++i) {
         const auto& day = w.days[i + 1];
         const int weekday = time_ok ? (local.tm_wday + i + 1) % 7 : (i + 2);
-        std::snprintf(buf, sizeof(buf), "%s %s  %d°/%d°",
-                      WeekdayName(weekday),
-                      epaper_dashboard::DashboardDataProvider::WeatherText(day.weather_code),
-                      day.temp_max, day.temp_min);
+        std::snprintf(buf, sizeof(buf), "%s\n%d°/%d°",
+                      WeekdayName(weekday), day.temp_max, day.temp_min);
         lv_label_set_text(weather_forecast_labels_[i], buf);
     }
 }
@@ -516,7 +563,6 @@ void EpaperDisplayT42::UpdateTodoLocked() {
     char buf[160];
     for (size_t i = 0; i < todo_labels_.size(); ++i) {
         const auto& item = dashboard_.todos[i];
-        // One compact line is much more legible in the narrow 181px card.
         std::snprintf(buf, sizeof(buf), "%s  %s",
                       item.time.c_str(), item.title.c_str());
         lv_label_set_text(todo_labels_[i], buf);
@@ -650,7 +696,28 @@ void EpaperDisplayT42::ClearChatMessages() {
 }
 
 void EpaperDisplayT42::UpdateStatusBar(bool update_all) {
-    (void)update_all;
+    if (!setup_ui_called_) return;
+
+    const std::time_t now = std::time(nullptr);
+    struct tm local = {};
+    if (!ValidSystemTime(now, &local)) return;
+
+    const int minute_key = local.tm_hour * 60 + local.tm_min;
+    const bool minute_changed = minute_key != last_clock_minute_;
+    const bool day_changed = local.tm_yday != last_clock_yday_;
+    if (!update_all && !minute_changed && !day_changed) return;
+
+    {
+        DisplayLockGuard lock(this);
+        UpdateClockLocked(update_all);
+    }
+
+    // Application calls UpdateStatusBar every second, but e-paper changes only
+    // once per minute. Date/lunar expands the region only at local midnight.
+    const uint32_t mask = (update_all || day_changed) ? REFRESH_DATE : REFRESH_CLOCK;
+    ESP_LOGI(TAG, "Clock update %02d:%02d China time%s",
+             local.tm_hour, local.tm_min, day_changed ? " (new day)" : "");
+    NotifyRefresh(mask);
 }
 
 void EpaperDisplayT42::SetPowerSaveMode(bool on) {
@@ -671,8 +738,6 @@ void EpaperDisplayT42::DataTaskLoop() {
     int64_t next_full_ms = now_ms + static_cast<int64_t>(cfg.full_refresh_minutes) * 60000;
 
     for (;;) {
-        // Word rotation is local and cheap. Clock updates are deliberately NOT
-        // handled here because HTTP below may block on a poor network.
         const std::time_t now = std::time(nullptr);
         struct tm local = {};
         if (ValidSystemTime(now, &local)) {
@@ -693,12 +758,14 @@ void EpaperDisplayT42::DataTaskLoop() {
         if (now_ms >= next_weather_ms) {
             auto weather = dashboard_.weather;
             if (data_provider_.FetchWeather(weather)) {
+                const bool city_changed = weather.city != dashboard_.weather.city;
                 dashboard_.weather = weather;
                 {
                     DisplayLockGuard lock(this);
                     UpdateWeatherLocked();
+                    if (city_changed) UpdateClockLocked(true);
                 }
-                NotifyRefresh(REFRESH_WEATHER);
+                NotifyRefresh(REFRESH_WEATHER | (city_changed ? REFRESH_DATE : REFRESH_NONE));
                 next_weather_ms =
                     now_ms + static_cast<int64_t>(cfg.weather_refresh_minutes) * 60000;
             } else {
@@ -771,17 +838,11 @@ void EpaperDisplayT42::LvglFlushCb(
 
                 for (int x = x0; x <= x1; ++x) {
                     const uint16_t p = pixels[src_row + static_cast<size_t>(x - area->x1)];
-                    const uint32_t r = (p >> 11) & 0x1F;
-                    const uint32_t g = (p >> 5) & 0x3F;
-                    const uint32_t b = p & 0x1F;
-                    const uint32_t lum =
-                        (r * 255 / 31) * 299 + (g * 255 / 63) * 587 + (b * 255 / 31) * 114;
-
                     const int local_x = x - self->capture_area_.x1;
                     uint8_t& out =
                         self->partial_buffer_[dst_row + static_cast<size_t>(local_x >> 3)];
                     const uint8_t bit = static_cast<uint8_t>(0x80 >> (local_x & 7));
-                    if (lum < 128000) out &= static_cast<uint8_t>(~bit);
+                    if (PixelIsBlack(p)) out &= static_cast<uint8_t>(~bit);
                     else out |= bit;
                 }
             }
@@ -803,12 +864,7 @@ void EpaperDisplayT42::LvglFlushCb(
         std::memset(self->mono_line_, 0xFF, MONO_LINE_BYTES);
         for (int x = 0; x < EPD_WIDTH; ++x) {
             const uint16_t p = pixels[static_cast<size_t>(row) * EPD_WIDTH + x];
-            const uint32_t r = (p >> 11) & 0x1F;
-            const uint32_t g = (p >> 5) & 0x3F;
-            const uint32_t b = p & 0x1F;
-            const uint32_t lum =
-                (r * 255 / 31) * 299 + (g * 255 / 63) * 587 + (b * 255 / 31) * 114;
-            if (lum < 128000) {
+            if (PixelIsBlack(p)) {
                 self->mono_line_[x >> 3] &=
                     static_cast<uint8_t>(~(0x80 >> (x & 7)));
             }
@@ -825,9 +881,6 @@ void EpaperDisplayT42::LvglFlushCb(
 
 void EpaperDisplayT42::NotifyRefresh(uint32_t mask) {
     pending_refresh_mask_.fetch_or(mask, std::memory_order_relaxed);
-    // Always queue the notification. If a new minute/status arrives while a
-    // physical refresh is running, FreeRTOS keeps the count and the refresh
-    // task processes it immediately afterwards instead of silently losing it.
     if (refresh_task_handle_ != nullptr) {
         xTaskNotifyGive(refresh_task_handle_);
     }
@@ -912,15 +965,23 @@ bool EpaperDisplayT42::CaptureUiRegion(
     const size_t row_bytes = static_cast<size_t>((x_end - x_start) / 8);
     const size_t required = row_bytes * static_cast<size_t>(y_end - y_start);
 
-    ReleasePartialBuffer();
-    partial_row_bytes_ = row_bytes;
-    partial_buffer_ = static_cast<uint8_t*>(heap_caps_malloc(required, MALLOC_CAP_8BIT));
-    if (partial_buffer_ == nullptr) {
-        ESP_LOGE(TAG, "Failed partial buffer %u bytes", static_cast<unsigned>(required));
-        partial_row_bytes_ = 0;
-        return false;
+    // Reuse one buffer across a refresh batch. Prefer PSRAM when present; the
+    // panel write is copied through the 100-byte DMA line buffer below.
+    if (partial_buffer_ == nullptr || partial_buffer_size_ < required) {
+        ReleasePartialBuffer();
+        partial_buffer_ = static_cast<uint8_t*>(
+            heap_caps_malloc(required, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (partial_buffer_ == nullptr) {
+            partial_buffer_ = static_cast<uint8_t*>(heap_caps_malloc(required, MALLOC_CAP_8BIT));
+        }
+        if (partial_buffer_ == nullptr) {
+            ESP_LOGE(TAG, "Failed partial buffer %u bytes", static_cast<unsigned>(required));
+            partial_row_bytes_ = 0;
+            return false;
+        }
+        partial_buffer_size_ = required;
     }
-    partial_buffer_size_ = required;
+    partial_row_bytes_ = row_bytes;
     std::memset(partial_buffer_, 0xFF, required);
 
     capture_area_.x1 = x_start;
@@ -948,31 +1009,31 @@ bool EpaperDisplayT42::CaptureUiRegion(
 }
 
 bool EpaperDisplayT42::WriteCapturedPartialRegion() {
-    if (partial_buffer_ == nullptr || partial_row_bytes_ == 0) return false;
+    if (partial_buffer_ == nullptr || partial_row_bytes_ == 0 || mono_line_ == nullptr) return false;
 
     const int x_start = capture_area_.x1;
     const int y_start = capture_area_.y1;
     const int x_end = capture_area_.x2 + 1;
     const int y_end = capture_area_.y2 + 1;
 
-    // Match GxEPD2_750_GDEY075T7: enter partial mode only while writing RAM,
-    // then leave partial mode. For this panel GxEPD2 deliberately does not use
-    // partial-window mode around the actual DISPLAY REFRESH (better image).
-    SendCommand(0x91); // PARTIAL IN
+    // Same strategy as GxEPD2_750_GDEY075T7: partial mode for RAM writing, but
+    // no 0x91/0x92 around DISPLAY REFRESH because usePartialUpdateWindow=false
+    // produces the cleaner image on this panel.
+    SendCommand(0x91);
     if (!SetPartialWindow(x_start, y_start, x_end, y_end)) return false;
-    SendCommand(0x13); // current image RAM
+    SendCommand(0x13);
     gpio_set_level(EPD_DC_PIN, 1);
     const int rows = y_end - y_start;
     for (int row = 0; row < rows; ++row) {
         const uint8_t* src =
             partial_buffer_ + static_cast<size_t>(row) * partial_row_bytes_;
-        if (SpiWrite(src, partial_row_bytes_) != ESP_OK) return false;
+        std::memcpy(mono_line_, src, partial_row_bytes_);
+        if (SpiWrite(mono_line_, partial_row_bytes_) != ESP_OK) return false;
     }
-    SendCommand(0x92); // PARTIAL OUT
+    SendCommand(0x92);
 
-    // Select the same RAM area for update, without 0x91/0x92 around refresh.
     if (!SetPartialWindow(x_start, y_start, x_end, y_end)) return false;
-    SendCommand(0x12); // DISPLAY REFRESH
+    SendCommand(0x12);
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     return WaitBusyRelease("partial-refresh", EPD_BUSY_TIMEOUT_MS);
 }
@@ -1066,12 +1127,11 @@ bool EpaperDisplayT42::InitPanelFullRefresh() {
 
 bool EpaperDisplayT42::InitPanelPartialRefresh() {
     HardwareReset();
-    // Important: every batch starts after deep sleep, so the full controller
-    // base configuration must be restored before selecting the partial LUT.
     ConfigurePanelBase();
-    SendCommand(0xE0); SendData(0x02); // TSFIX
-    SendCommand(0xE5); SendData(0x6E); // fixed partial temperature waveform
-    SendCommand(0x04); // POWER ON
+    // GxEPD2 fast partial OTP waveform selection for GDEY075T7.
+    SendCommand(0xE0); SendData(0x02);
+    SendCommand(0xE5); SendData(0x6E);
+    SendCommand(0x04);
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     if (!WaitBusyRelease("power-on/partial", EPD_BUSY_TIMEOUT_MS)) {
         panel_powered_ = false;
@@ -1089,16 +1149,11 @@ bool EpaperDisplayT42::SetPartialWindow(
     y_end = std::min(EPD_HEIGHT, y_end);
     if (x_start >= x_end || y_start >= y_end) return false;
 
-    // UC8179 expects inclusive pixel coordinates. The previous implementation
-    // accidentally sent the first pixel of the final byte as X-end (e.g. 328)
-    // while transmitting the complete byte through pixel 335. That row-length
-    // mismatch caused RAM wrapping and the large garbage/ghost blocks seen on
-    // the physical panel.
     const int panel_x_start = x_start & ~7;
     const int panel_x_end = (x_end - 1) | 0x07;
     const int panel_y_end = y_end - 1;
 
-    SendCommand(0x90); // PARTIAL WINDOW / RAM area
+    SendCommand(0x90);
     SendData(static_cast<uint8_t>((panel_x_start >> 8) & 0xFF));
     SendData(static_cast<uint8_t>(panel_x_start & 0xFF));
     SendData(static_cast<uint8_t>((panel_x_end >> 8) & 0xFF));
@@ -1130,7 +1185,6 @@ bool EpaperDisplayT42::RefreshPanelFull() {
         return false;
     }
 
-    // GDEY075T7 supports the fast full-refresh OTP waveform (~1.2s typical).
     SendCommand(0xE0); SendData(0x02);
     SendCommand(0xE5); SendData(0x5A);
     SendCommand(0x12);
@@ -1151,9 +1205,7 @@ bool EpaperDisplayT42::RefreshPartialRegion(
     ESP_LOGI(TAG, "Partial %s x=%d..%d y=%d..%d",
              name, x_start, x_end - 1, y_start, y_end - 1);
     if (!CaptureUiRegion(x_start, y_start, x_end, y_end)) return false;
-    const bool ok = WriteCapturedPartialRegion();
-    ReleasePartialBuffer();
-    return ok;
+    return WriteCapturedPartialRegion();
 }
 
 bool EpaperDisplayT42::RefreshPanelPartial(uint32_t mask) {
@@ -1165,22 +1217,39 @@ bool EpaperDisplayT42::RefreshPanelPartial(uint32_t mask) {
         return false;
     }
 
+    // Collapse changes within each visual band to one physical waveform. This
+    // keeps peak temporary RAM below ~18 KB while avoiding multiple flashes for
+    // overlapping widgets in the same row.
     bool ok = true;
     uint32_t count = 0;
-    auto refresh_if = [&](uint32_t bit, const Region& r) {
-        if (ok && (mask & bit) != 0) {
-            ok = RefreshPartialRegion(r.x0, r.y0, r.x1, r.y1, r.name);
-            if (ok) ++count;
-        }
+
+    auto refresh_region = [&](const Region& r) {
+        if (!ok) return;
+        ok = RefreshPartialRegion(r.x0, r.y0, r.x1, r.y1, r.name);
+        if (ok) ++count;
     };
 
-    refresh_if(REFRESH_CLOCK, kClockRegion);
-    refresh_if(REFRESH_HEADER, kHeaderRegion);
-    refresh_if(REFRESH_WEATHER, kWeatherRegion);
-    refresh_if(REFRESH_TODO, kTodoRegion);
-    refresh_if(REFRESH_QUICK, kQuickRegion);
-    refresh_if(REFRESH_WORD, kWordRegion);
-    refresh_if(REFRESH_CHAT, kChatRegion);
+    const uint32_t top_mask = mask & (REFRESH_CLOCK | REFRESH_DATE | REFRESH_HEADER);
+    if (top_mask != 0) {
+        if ((top_mask & REFRESH_HEADER) != 0) refresh_region(kHeaderRegion);
+        else if ((top_mask & REFRESH_DATE) != 0) refresh_region(kClockCardRegion);
+        else refresh_region(kClockDigitsRegion);
+    }
+
+    const uint32_t middle_mask = mask & (REFRESH_WEATHER | REFRESH_TODO | REFRESH_QUICK);
+    if (ok && middle_mask != 0) {
+        if ((middle_mask & REFRESH_QUICK) != 0) refresh_region(kQuickRegion);
+        else if ((middle_mask & REFRESH_TODO) != 0) refresh_region(kTodoRegion);
+        else refresh_region(kWeatherRegion);
+    }
+
+    const uint32_t bottom_mask = mask & (REFRESH_WORD | REFRESH_CHAT);
+    if (ok && bottom_mask != 0) {
+        // kChatRegion begins at X=0 and spans the whole lower band, so when chat
+        // is dirty it naturally includes the word card without a second flash.
+        if ((bottom_mask & REFRESH_CHAT) != 0) refresh_region(kChatRegion);
+        else refresh_region(kWordRegion);
+    }
 
     ReleasePartialBuffer();
     SleepPanel();
