@@ -29,9 +29,9 @@ constexpr size_t kMaxUserBytes = 160;
 constexpr size_t kMaxAssistantBytes = 300;
 constexpr uint32_t kPartialDebounceMs = 220;
 constexpr uint32_t kRefreshTriggerDelayMs = 100;
-// With one minute clock updates, 32 successful differential refreshes means a
-// clean full refresh roughly every half hour. This keeps text/borders crisp.
-constexpr uint32_t kPartialRefreshLimit = 32;
+// Fast partial refresh is differential. Do a clean full waveform before many
+// small updates can accumulate visible contrast loss or ghosting.
+constexpr uint32_t kPartialRefreshLimit = 20;
 // POSIX TZ signs are reversed: CST-8 means UTC+8.
 constexpr char kChinaTimezone[] = "CST-8";
 
@@ -113,7 +113,7 @@ EpaperDisplayT42::EpaperDisplayT42()
 
     ready_ = true;
     ESP_LOGI(TAG,
-             "Ready: GDEY075T7 800x480 dashboard, banded X0 partial refresh, "
+             "Ready: GDEY075T7 800x480 dashboard, preserved-RAM partial refresh, "
              "PWR=3V3 BUSY=%d RST=%d DC=%d CS=%d CLK=%d DIN=%d",
              EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN,
              EPD_CS_PIN, EPD_SCLK_PIN, EPD_MOSI_PIN);
@@ -279,7 +279,6 @@ lv_obj_t* EpaperDisplayT42::CreateSymbolLabel(
     lv_obj_set_width(label, w);
     lv_label_set_text(label, symbol != nullptr ? symbol : "");
     lv_obj_set_style_text_color(label, lv_color_black(), 0);
-    // FontAwesome symbols are included in LVGL's default built-in font.
     lv_obj_set_style_text_font(label, LV_FONT_DEFAULT, 0);
     lv_obj_set_style_text_align(label, align, 0);
     lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
@@ -363,8 +362,6 @@ void EpaperDisplayT42::SetClockDigit(int index, int digit) {
 }
 
 void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
-    // 800x480 fixed grid with clear dashboard cards, inspired by practical
-    // information displays rather than a phone/tablet touch interface.
     CreateBox(screen, 5, 5, 326, 126);
     CreateBox(screen, 336, 5, 459, 126);
     CreateBox(screen, 5, 137, 339, 162);
@@ -373,12 +370,10 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     CreateBox(screen, 5, 305, 284, 170);
     CreateBox(screen, 294, 305, 501, 170);
 
-    // Clock / local calendar.
     CreateSevenSegmentClock(screen);
     date_label_ = CreateLabel(screen, 20, 91, 298, "日期");
     lunar_label_ = CreateLabel(screen, 20, 111, 298, "农历");
 
-    // Xiaozhi header with real monochrome pictograms from LVGL symbols.
     CreateSymbolLabel(screen, 354, 18, 20, LV_SYMBOL_AUDIO);
     CreateLabel(screen, 380, 18, 245, "小智桌面屏");
     CreateSymbolLabel(screen, 704, 18, 24, LV_SYMBOL_WIFI, LV_TEXT_ALIGN_CENTER);
@@ -387,7 +382,6 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     CreateSymbolLabel(screen, 354, 82, 20, LV_SYMBOL_BELL);
     CreateLabel(screen, 380, 82, 390, "语音唤醒｜天气 · 日程 · 提醒 · 设备状态");
 
-    // Weather: graphical badge row similar to a compact e-paper forecast.
     CreateSymbolLabel(screen, 18, 148, 20, LV_SYMBOL_GPS);
     weather_title_label_ = CreateLabel(screen, 43, 148, 285, "当前位置 · 天气");
     const int badge_x[4] = {30, 108, 186, 264};
@@ -400,15 +394,12 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     weather_forecast_labels_[1] = CreateLabel(screen, 165, 214, 75, "周三\n28°/23°", LV_TEXT_ALIGN_CENTER);
     weather_forecast_labels_[2] = CreateLabel(screen, 243, 214, 82, "周四\n27°/22°", LV_TEXT_ALIGN_CENTER);
 
-    // Todos.
     CreateSymbolLabel(screen, 362, 149, 20, LV_SYMBOL_BELL);
     CreateLabel(screen, 386, 149, 132, "今日待办");
     todo_labels_[0] = CreateLabel(screen, 362, 182, 156, "");
     todo_labels_[1] = CreateLabel(screen, 362, 219, 156, "");
     todo_labels_[2] = CreateLabel(screen, 362, 256, 156, "");
 
-    // Connected information placeholders: graphical category icons now, API
-    // values later. These FontAwesome glyphs live in flash, not image buffers.
     CreateSymbolLabel(screen, 548, 149, 20, LV_SYMBOL_DRIVE);
     CreateSymbolLabel(screen, 548, 186, 20, LV_SYMBOL_ENVELOPE);
     CreateSymbolLabel(screen, 548, 223, 20, LV_SYMBOL_HOME);
@@ -418,7 +409,6 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     quick_labels_[2] = CreateLabel(screen, 574, 223, 205, "");
     quick_labels_[3] = CreateLabel(screen, 574, 260, 205, "");
 
-    // Word card.
     CreateSymbolLabel(screen, 18, 316, 20, LV_SYMBOL_EDIT);
     CreateLabel(screen, 42, 316, 226, "每日记单词");
     word_label_ = CreateLabel(screen, 18, 341, 250, "abandon");
@@ -427,7 +417,6 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     example_label_ = CreateLabel(screen, 18, 411, 255, "例：Don't abandon your plan.");
     word_footer_label_ = CreateLabel(screen, 18, 452, 255, "20词 · 30分钟轮播 · 1/20");
 
-    // Conversation card: no touch semantics; physical button + voice wake only.
     user_label_ = CreateLabel(screen, 310, 319, 468, "你：等待你说话");
     CreateSymbolLabel(screen, 310, 352, 20, LV_SYMBOL_AUDIO);
     assistant_label_ = CreateLabel(screen, 334, 352, 444, "小智：准备好了，随时可以聊。");
@@ -467,8 +456,6 @@ void EpaperDisplayT42::SetupUI() {
     ESP_LOGI(TAG, "Desk dashboard UI ready");
     NotifyRefresh(REFRESH_FULL);
 
-    // Reuse Application's existing 1-second clock event instead of allocating
-    // another FreeRTOS task. This returns ~3 KB internal RAM to Opus/audio.
     if (data_task_handle_ == nullptr) {
         if (xTaskCreate(DataTaskEntry, "epaper_data", 7168, this, 1,
                         &data_task_handle_) != pdPASS) {
@@ -712,8 +699,6 @@ void EpaperDisplayT42::UpdateStatusBar(bool update_all) {
         UpdateClockLocked(update_all);
     }
 
-    // Application calls UpdateStatusBar every second, but e-paper changes only
-    // once per minute. Date/lunar expands the region only at local midnight.
     const uint32_t mask = (update_all || day_changed) ? REFRESH_DATE : REFRESH_CLOCK;
     ESP_LOGI(TAG, "Clock update %02d:%02d China time%s",
              local.tm_hour, local.tm_min, day_changed ? " (new day)" : "");
@@ -905,13 +890,15 @@ void EpaperDisplayT42::RefreshTaskLoop() {
         if (mask == REFRESH_NONE) continue;
 
         const bool force_full =
-            !full_refresh_done_ ||
+            !full_refresh_done_ || !panel_ram_valid_ ||
             ((mask & REFRESH_FULL) != 0) ||
             (partial_refresh_count_ >= kPartialRefreshLimit);
 
         bool ok = force_full ? RefreshPanelFull() : RefreshPanelPartial(mask);
         if (!ok && !force_full) {
-            ESP_LOGW(TAG, "Partial refresh failed; falling back to full refresh");
+            ESP_LOGW(TAG, "Partial refresh failed; rebuilding full panel RAM");
+            panel_ram_valid_ = false;
+            SleepPanel();
             ok = RefreshPanelFull();
         }
         if (!ok) {
@@ -965,8 +952,6 @@ bool EpaperDisplayT42::CaptureUiRegion(
     const size_t row_bytes = static_cast<size_t>((x_end - x_start) / 8);
     const size_t required = row_bytes * static_cast<size_t>(y_end - y_start);
 
-    // Reuse one buffer across a refresh batch. Prefer PSRAM when present; the
-    // panel write is copied through the 100-byte DMA line buffer below.
     if (partial_buffer_ == nullptr || partial_buffer_size_ < required) {
         ReleasePartialBuffer();
         partial_buffer_ = static_cast<uint8_t*>(
@@ -1016,9 +1001,6 @@ bool EpaperDisplayT42::WriteCapturedPartialRegion() {
     const int x_end = capture_area_.x2 + 1;
     const int y_end = capture_area_.y2 + 1;
 
-    // Same strategy as GxEPD2_750_GDEY075T7: partial mode for RAM writing, but
-    // no 0x91/0x92 around DISPLAY REFRESH because usePartialUpdateWindow=false
-    // produces the cleaner image on this panel.
     SendCommand(0x91);
     if (!SetPartialWindow(x_start, y_start, x_end, y_end)) return false;
     SendCommand(0x13);
@@ -1097,7 +1079,6 @@ bool EpaperDisplayT42::WaitBusyRelease(const char* reason, uint32_t timeout_ms) 
 }
 
 void EpaperDisplayT42::ConfigurePanelBase() {
-    // GDEY075T7 / UC8179 base sequence from GxEPD2.
     SendCommand(0x00); SendData(0x1F);
     SendCommand(0x01);
     SendData(0x07); SendData(0x07); SendData(0x3F); SendData(0x3F); SendData(0x09);
@@ -1106,13 +1087,21 @@ void EpaperDisplayT42::ConfigurePanelBase() {
     SendCommand(0x61);
     SendData(0x03); SendData(0x20); SendData(0x01); SendData(0xE0);
     SendCommand(0x15); SendData(0x00);
+    // 0x29 enables N2OCP: after a refresh the controller copies NEW RAM to OLD
+    // RAM, which is exactly the baseline required by the next differential update.
     SendCommand(0x50); SendData(0x29); SendData(0x07);
     SendCommand(0x60); SendData(0x22);
     SendCommand(0xE3); SendData(0x22);
 }
 
 bool EpaperDisplayT42::InitPanelFullRefresh() {
-    HardwareReset();
+    // Only reset after true controller hibernate or recovery. Routine power-off
+    // keeps UC8179 RAM alive so OLD/NEW differential state remains coherent.
+    if (controller_hibernating_) {
+        HardwareReset();
+        controller_hibernating_ = false;
+        panel_ram_valid_ = false;
+    }
     ConfigurePanelBase();
     SendCommand(0x00); SendData(0x1F);
     SendCommand(0x04);
@@ -1126,15 +1115,22 @@ bool EpaperDisplayT42::InitPanelFullRefresh() {
 }
 
 bool EpaperDisplayT42::InitPanelPartialRefresh() {
-    HardwareReset();
+    // Never start a differential waveform after RAM state was lost. Rebuild it
+    // with one full refresh instead of applying a partial update against an
+    // unknown OLD plane, which shows up as washed-out / fading pixels.
+    if (controller_hibernating_ || !panel_ram_valid_) {
+        ESP_LOGW(TAG, "Partial refresh requested without valid panel RAM");
+        return false;
+    }
+
     ConfigurePanelBase();
-    // GxEPD2 fast partial OTP waveform selection for GDEY075T7.
     SendCommand(0xE0); SendData(0x02);
     SendCommand(0xE5); SendData(0x6E);
     SendCommand(0x04);
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     if (!WaitBusyRelease("power-on/partial", EPD_BUSY_TIMEOUT_MS)) {
         panel_powered_ = false;
+        panel_ram_valid_ = false;
         return false;
     }
     panel_powered_ = true;
@@ -1167,20 +1163,26 @@ bool EpaperDisplayT42::SetPartialWindow(
 }
 
 bool EpaperDisplayT42::RefreshPanelFull() {
-    ESP_LOGI(TAG, "Full refresh begin");
+    ESP_LOGI(TAG, "Full refresh begin (ram_valid=%d)", panel_ram_valid_ ? 1 : 0);
     if (!InitPanelFullRefresh()) {
         SleepPanel();
         return false;
     }
 
-    SendCommand(0x10);
-    if (!StreamSolidPlane(0x00)) {
-        SleepPanel();
-        return false;
+    // GxEPD2 initializes OLD RAM to black only for the initial/recovery refresh.
+    // Do not overwrite OLD with black on every maintenance full refresh: doing so
+    // destroys the differential baseline and needlessly overdrives the next cycle.
+    if (!panel_ram_valid_) {
+        SendCommand(0x10);
+        if (!StreamSolidPlane(0x00)) {
+            SleepPanel();
+            return false;
+        }
     }
 
     SendCommand(0x13);
     if (!StreamCurrentUiToPanel()) {
+        panel_ram_valid_ = false;
         SleepPanel();
         return false;
     }
@@ -1191,11 +1193,19 @@ bool EpaperDisplayT42::RefreshPanelFull() {
     vTaskDelay(pdMS_TO_TICKS(kRefreshTriggerDelayMs));
     const bool ok = WaitBusyRelease("display-refresh/full", EPD_BUSY_TIMEOUT_MS);
 
-    SleepPanel();
     if (ok) {
+        // VCOM setting 0x29 enables N2OCP, so the completed NEW image becomes the
+        // OLD baseline. Power off the high-voltage rails, but do NOT deep-sleep
+        // the controller between normal updates; its RAM is the differential state.
+        panel_ram_valid_ = true;
         full_refresh_done_ = true;
         partial_refresh_count_ = 0;
+        PowerOffPanel();
+    } else {
+        panel_ram_valid_ = false;
+        SleepPanel();
     }
+
     ESP_LOGI(TAG, "Full refresh %s", ok ? "done" : "failed");
     return ok;
 }
@@ -1213,13 +1223,9 @@ bool EpaperDisplayT42::RefreshPanelPartial(uint32_t mask) {
              static_cast<unsigned long>(mask));
 
     if (!InitPanelPartialRefresh()) {
-        SleepPanel();
         return false;
     }
 
-    // Collapse changes within each visual band to one physical waveform. This
-    // keeps peak temporary RAM below ~18 KB while avoiding multiple flashes for
-    // overlapping widgets in the same row.
     bool ok = true;
     uint32_t count = 0;
 
@@ -1245,30 +1251,45 @@ bool EpaperDisplayT42::RefreshPanelPartial(uint32_t mask) {
 
     const uint32_t bottom_mask = mask & (REFRESH_WORD | REFRESH_CHAT);
     if (ok && bottom_mask != 0) {
-        // kChatRegion begins at X=0 and spans the whole lower band, so when chat
-        // is dirty it naturally includes the word card without a second flash.
         if ((bottom_mask & REFRESH_CHAT) != 0) refresh_region(kChatRegion);
         else refresh_region(kWordRegion);
     }
 
     ReleasePartialBuffer();
-    SleepPanel();
-    if (ok) partial_refresh_count_ += count;
+    if (ok) {
+        partial_refresh_count_ += count;
+        // Preserve OLD/NEW RAM. Only the high-voltage panel supply is switched off.
+        PowerOffPanel();
+    } else {
+        panel_ram_valid_ = false;
+        SleepPanel();
+    }
 
-    ESP_LOGI(TAG, "Partial batch %s count=%lu/%u",
+    ESP_LOGI(TAG, "Partial batch %s count=%lu/%u ram=%s",
              ok ? "done" : "failed",
              static_cast<unsigned long>(partial_refresh_count_),
-             static_cast<unsigned>(kPartialRefreshLimit));
+             static_cast<unsigned>(kPartialRefreshLimit),
+             panel_ram_valid_ ? "valid" : "invalid");
     return ok;
 }
 
-void EpaperDisplayT42::SleepPanel() {
+void EpaperDisplayT42::PowerOffPanel() {
     if (spi_ == nullptr || !panel_powered_) return;
 
-    SendCommand(0x50); SendData(0xF7);
+    // Match GxEPD2 _PowerOff(): disable panel driving voltages but leave the
+    // controller awake. This prevents static-image fading while retaining RAM.
     SendCommand(0x02);
     vTaskDelay(pdMS_TO_TICKS(20));
     WaitBusyRelease("power-off", 3000);
-    SendCommand(0x07); SendData(0xA5);
     panel_powered_ = false;
+}
+
+void EpaperDisplayT42::SleepPanel() {
+    if (spi_ == nullptr) return;
+
+    PowerOffPanel();
+    SendCommand(0x07);
+    SendData(0xA5);
+    controller_hibernating_ = true;
+    panel_ram_valid_ = false;
 }
