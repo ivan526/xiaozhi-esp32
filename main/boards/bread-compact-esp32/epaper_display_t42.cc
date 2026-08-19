@@ -66,7 +66,7 @@ inline bool PixelIsBlack(uint16_t p) {
     const uint32_t g6 = (p >> 5) & 0x3F;
     const uint32_t b6 = (p & 0x1F) << 1;
     const uint32_t luminance = r6 * 19 + g6 * 38 + b6 * 7; // weights sum to 64
-    return luminance < (32u * 64u); // crisp midpoint threshold; text/font assets are already 1-bpp
+    return luminance < (38u * 64u); // keep 16px CJK strokes complete without over-thickening
 }
 
 void StyleSolidBlack(lv_obj_t* obj) {
@@ -400,15 +400,15 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
         lv_obj_set_size(line, w, h);
         StyleSolidBlack(line);
     };
-    auto one_line = [&](lv_obj_t* label, int height = 18) {
+    auto one_line = [&](lv_obj_t* label, int height = 22) {
         if (label == nullptr) return;
         lv_obj_set_height(label, height);
         lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
     };
 
     CreateSevenSegmentClock(screen);
-    date_label_ = CreateLabel(screen, 18, 101, 302, "日期 · 农历", LV_TEXT_ALIGN_CENTER);
-    one_line(date_label_, 20);
+    date_label_ = CreateLabel(screen, 14, 99, 312, "日期 · 农历", LV_TEXT_ALIGN_CENTER);
+    one_line(date_label_, 24);
     lunar_label_ = nullptr; // lunar date is intentionally merged into date_label_
 
     CreateBitmapIcon(screen, 352, 14, &ep_icon_robot_24);
@@ -450,7 +450,7 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     todo_labels_[0] = CreateLabel(screen, 362, 184, 158, "");
     todo_labels_[1] = CreateLabel(screen, 362, 224, 158, "");
     todo_labels_[2] = CreateLabel(screen, 362, 264, 158, "");
-    for (auto* label : todo_labels_) one_line(label, 19);
+    for (auto* label : todo_labels_) one_line(label, 22);
 
     const int quick_y[4] = {149, 186, 223, 260};
     CreateBitmapIcon(screen, 550, 146, &ep_icon_commute_20);
@@ -459,23 +459,23 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     CreateBitmapIcon(screen, 550, 257, &ep_icon_market_20);
     for (int i = 0; i < 4; ++i) {
         quick_labels_[i] = CreateLabel(screen, 576, quick_y[i], 202, "");
-        one_line(quick_labels_[i], 19);
+        one_line(quick_labels_[i], 22);
     }
 
     CreateBitmapIcon(screen, 18, 313, &ep_icon_word_20);
     auto* word_title = CreateLabel(screen, 42, 316, 226, "每日记单词");
     one_line(word_title);
     word_label_ = CreateLabel(screen, 18, 343, 250, "abandon");
-    one_line(word_label_, 20);
+    one_line(word_label_, 22);
     phonetic_label_ = CreateLabel(screen, 18, 366, 250, "/əˈbændən/");
-    one_line(phonetic_label_, 20);
+    one_line(phonetic_label_, 22);
     meaning_label_ = CreateLabel(screen, 18, 390, 250, "放弃；遗弃");
-    one_line(meaning_label_, 20);
+    one_line(meaning_label_, 22);
     example_label_ = CreateLabel(screen, 18, 416, 255, "例：Don't abandon your plan.");
     lv_obj_set_height(example_label_, 30);
     lv_label_set_long_mode(example_label_, LV_LABEL_LONG_WRAP);
     word_footer_label_ = CreateLabel(screen, 18, 451, 255, "20词 · 30分钟轮播 · 1/20");
-    one_line(word_footer_label_, 18);
+    one_line(word_footer_label_, 20);
 
     user_label_ = CreateLabel(screen, 310, 319, 468, "你：等待你说话");
     lv_obj_set_height(user_label_, 25);
@@ -487,7 +487,7 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     CreateBitmapIcon(screen, 310, 446, &ep_icon_mic_20);
     auto* chat_hint = CreateLabel(screen, 336, 449, 442,
                                   "语音唤醒｜按键说话｜天气 · 日程 · 提醒");
-    one_line(chat_hint, 18);
+    one_line(chat_hint, 20);
 
     UpdateClockLocked(true);
     UpdateHeaderLocked();
@@ -553,16 +553,36 @@ void EpaperDisplayT42::UpdateClockLocked(bool force) {
     SetClockDigit(2, local.tm_min / 10);
     SetClockDigit(3, local.tm_min % 10);
 
-    const std::string lunar = epaper_dashboard::FormatLunarDate(
+    std::string lunar = epaper_dashboard::FormatLunarDate(
         local.tm_year + 1900, local.tm_mon + 1, local.tm_mday);
 
-    // Date + weekday + lunar date share one crisp baseline. Location already
-    // appears in the weather card, so the clock card stays uncluttered.
+    // Keep only the lunar month/day in the compact clock row.  FormatLunarDate
+    // may include an "农历" prefix and/or a ganzhi year; both are redundant on
+    // this card and can make LVGL wrap the row on an 800x480 dashboard.
+    const std::string lunar_prefix = "农历";
+    if (lunar.rfind(lunar_prefix, 0) == 0) {
+        lunar.erase(0, lunar_prefix.size());
+    }
+    const std::string year_mark = "年";
+    const size_t year_pos = lunar.find(year_mark);
+    if (year_pos != std::string::npos) {
+        lunar = lunar.substr(year_pos + year_mark.size());
+    }
+    while (!lunar.empty() && (lunar.front() == ' ' || lunar.front() == '\t')) {
+        lunar.erase(lunar.begin());
+    }
+    if (lunar.empty()) lunar = "--";
+
+    // Gregorian date + weekday + compact lunar date are guaranteed to use one
+    // label and one baseline. Location remains in the weather card.
     char date[128];
-    std::snprintf(date, sizeof(date), "%d月%d日 %s · %s",
+    std::snprintf(date, sizeof(date), "%d月%d日 %s · 农历%s",
                   local.tm_mon + 1, local.tm_mday, WeekdayName(local.tm_wday),
                   lunar.c_str());
-    if (date_label_ != nullptr) lv_label_set_text(date_label_, date);
+    if (date_label_ != nullptr) {
+        lv_label_set_text(date_label_, date);
+        lv_label_set_long_mode(date_label_, LV_LABEL_LONG_DOT);
+    }
 
     last_clock_minute_ = minute_key;
     last_clock_yday_ = local.tm_yday;
