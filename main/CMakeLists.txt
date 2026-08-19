@@ -104,9 +104,10 @@ elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_NT26)
     set(BUILTIN_ICON_FONT font_material_symbols_14_1)
 elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_ESP32)
     set(BOARD_DIR "bread-compact-esp32")
-    # 16px/4bpp improves Chinese stroke definition on the 800x480 e-paper.
-    set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
-    set(BUILTIN_ICON_FONT font_material_symbols_16_4)
+    # Inksight-style crisp raster: use the project's native 1-bpp Noto Sans.
+    # 14px keeps dense Chinese dashboard copy readable without gray AA fringes.
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
+    set(BUILTIN_ICON_FONT font_material_symbols_14_1)
 elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_ESP32_LCD)
     set(BOARD_DIR "bread-compact-esp32-lcd")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)

@@ -40,14 +40,14 @@ struct Region { int x0; int y0; int x1; int y1; const char* name; };
 // This physical GDEY075T7 setup is most stable with partial RAM windows starting
 // at X=0. Keep regions narrow in height, and group updates by top/middle/bottom
 // bands so each waveform is useful without allocating a giant 48 KB buffer.
-constexpr Region kClockDigitsRegion {0, 0,   264, 90,  "clock-digits"};
-constexpr Region kClockCardRegion   {0, 0,   336, 136, "clock-card"};
-constexpr Region kHeaderRegion      {0, 0,   800, 136, "header"};
-constexpr Region kWeatherRegion     {0, 132, 352, 304, "weather"};
-constexpr Region kTodoRegion        {0, 132, 536, 304, "todo"};
+constexpr Region kClockDigitsRegion {0, 0,   296, 92,  "clock-digits"};
+constexpr Region kClockCardRegion   {0, 0,   338, 138, "clock-card"};
+constexpr Region kHeaderRegion      {0, 0,   800, 138, "header"};
+constexpr Region kWeatherRegion     {0, 132, 350, 304, "weather"};
+constexpr Region kTodoRegion        {0, 132, 540, 304, "todo"};
 constexpr Region kQuickRegion       {0, 132, 800, 304, "quick"};
-constexpr Region kWordRegion        {0, 300, 296, 480, "word"};
-constexpr Region kChatRegion        {0, 300, 800, 480, "chat"};
+constexpr Region kWordRegion        {0, 298, 296, 480, "word"};
+constexpr Region kChatRegion        {0, 298, 800, 480, "chat"};
 
 constexpr uint8_t kDigitSegments[10] = {
     0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110,
@@ -66,7 +66,7 @@ inline bool PixelIsBlack(uint16_t p) {
     const uint32_t g6 = (p >> 5) & 0x3F;
     const uint32_t b6 = (p & 0x1F) << 1;
     const uint32_t luminance = r6 * 19 + g6 * 38 + b6 * 7; // weights sum to 64
-    return luminance < (42u * 64u); // thicken 4bpp anti-aliased text for 1-bit e-paper
+    return luminance < (32u * 64u); // crisp midpoint threshold; text/font assets are already 1-bpp
 }
 
 void StyleSolidBlack(lv_obj_t* obj) {
@@ -267,7 +267,7 @@ lv_obj_t* EpaperDisplayT42::CreateBox(lv_obj_t* screen, int x, int y, int w, int
     lv_obj_t* box = lv_obj_create(screen);
     lv_obj_set_pos(box, x, y);
     lv_obj_set_size(box, w, h);
-    lv_obj_set_style_radius(box, 2, 0);
+    lv_obj_set_style_radius(box, 0, 0); // pixel-sharp grid on monochrome e-paper
     lv_obj_set_style_border_width(box, 1, 0);
     lv_obj_set_style_border_color(box, lv_color_black(), 0);
     lv_obj_set_style_bg_color(box, lv_color_white(), 0);
@@ -331,7 +331,7 @@ lv_obj_t* EpaperDisplayT42::CreateWeatherBadge(
 }
 
 void EpaperDisplayT42::CreateSevenSegmentClock(lv_obj_t* screen) {
-    constexpr int x0 = 22;
+    constexpr int x0 = 58;
     constexpr int y0 = 14;
     constexpr int digit_w = 48;
     constexpr int digit_h = 70;
@@ -384,70 +384,110 @@ void EpaperDisplayT42::SetClockDigit(int index, int digit) {
 }
 
 void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
-    CreateBox(screen, 5, 5, 326, 126);
-    CreateBox(screen, 336, 5, 459, 126);
-    CreateBox(screen, 5, 137, 339, 162);
-    CreateBox(screen, 349, 137, 181, 162);
-    CreateBox(screen, 535, 137, 260, 162);
-    CreateBox(screen, 5, 305, 284, 170);
-    CreateBox(screen, 294, 305, 501, 170);
+    // A strict 6px outer margin + 6px gutters makes every card land on the
+    // same visual grid. This follows Inksight's pixel-aligned layout approach.
+    CreateBox(screen, 6,   6, 326, 126);
+    CreateBox(screen, 338, 6, 456, 126);
+    CreateBox(screen, 6,   138, 338, 160);
+    CreateBox(screen, 350, 138, 184, 160);
+    CreateBox(screen, 540, 138, 254, 160);
+    CreateBox(screen, 6,   304, 284, 170);
+    CreateBox(screen, 296, 304, 498, 170);
+
+    auto divider = [&](int x, int y, int w, int h) {
+        lv_obj_t* line = lv_obj_create(screen);
+        lv_obj_set_pos(line, x, y);
+        lv_obj_set_size(line, w, h);
+        StyleSolidBlack(line);
+    };
+    auto one_line = [&](lv_obj_t* label, int height = 18) {
+        if (label == nullptr) return;
+        lv_obj_set_height(label, height);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    };
 
     CreateSevenSegmentClock(screen);
-    date_label_ = CreateLabel(screen, 20, 91, 298, "日期");
-    lunar_label_ = CreateLabel(screen, 20, 111, 298, "农历");
+    date_label_ = CreateLabel(screen, 18, 101, 302, "日期 · 农历", LV_TEXT_ALIGN_CENTER);
+    one_line(date_label_, 20);
+    lunar_label_ = nullptr; // lunar date is intentionally merged into date_label_
 
     CreateBitmapIcon(screen, 352, 14, &ep_icon_robot_24);
-    CreateLabel(screen, 380, 18, 245, "小智桌面屏");
+    auto* title = CreateLabel(screen, 380, 18, 250, "小智桌面屏");
+    one_line(title);
     CreateSymbolLabel(screen, 704, 18, 24, LV_SYMBOL_WIFI, LV_TEXT_ALIGN_CENTER);
     CreateSymbolLabel(screen, 742, 18, 24, LV_SYMBOL_USB, LV_TEXT_ALIGN_CENTER);
     status_label_ = CreateLabel(screen, 354, 49, 420, "已联网 · 正在启动");
+    one_line(status_label_);
     CreateSymbolLabel(screen, 354, 82, 20, LV_SYMBOL_BELL);
-    CreateLabel(screen, 380, 82, 390, "语音唤醒｜天气 · 日程 · 提醒 · 设备状态");
+    auto* hints = CreateLabel(screen, 380, 82, 390, "语音唤醒｜天气 · 日程 · 提醒 · 设备状态");
+    one_line(hints);
 
+    // Weather card: current conditions + three equal-width forecast columns.
     CreateBitmapIcon(screen, 18, 146, &ep_icon_location_20);
-    weather_title_label_ = CreateLabel(screen, 43, 148, 285, "当前位置 · 天气");
-    // High-fidelity weather composition: current conditions on the left,
-    // three compact forecast columns on the right, all using real I1 bitmaps.
-    weather_icon_labels_[0] = CreateBitmapIcon(screen, 18, 181, &ep_icon_weather_partly_40);
-    weather_current_label_ = CreateLabel(screen, 62, 178, 92, "今日 多云\n30°/24°");
-    weather_aqi_label_ = CreateLabel(screen, 62, 230, 92, "AQI 52 优");
-    const int wx[3] = {158, 218, 278};
+    weather_title_label_ = CreateLabel(screen, 43, 148, 286, "当前位置 · 天气");
+    one_line(weather_title_label_);
+    divider(151, 176, 1, 108);
+    divider(212, 176, 1, 108);
+    divider(273, 176, 1, 108);
+
+    weather_icon_labels_[0] = CreateBitmapIcon(screen, 18, 184, &ep_icon_weather_partly_40);
+    weather_current_label_ = CreateLabel(screen, 64, 181, 82, "今日 多云\n30°/24°");
+    weather_aqi_label_ = CreateLabel(screen, 64, 230, 82, "AQI 52 优");
+    one_line(weather_aqi_label_);
+
+    const int wx[3] = {162, 223, 284};
+    const int label_x[3] = {153, 214, 275};
     for (int i = 0; i < 3; ++i) {
-        weather_icon_labels_[i + 1] = CreateBitmapIcon(screen, wx[i], 179, &ep_icon_weather_cloud_40);
+        weather_icon_labels_[i + 1] = CreateBitmapIcon(screen, wx[i], 181, &ep_icon_weather_cloud_40);
     }
-    weather_forecast_labels_[0] = CreateLabel(screen, 150, 224, 56, "周二\n31°/24°", LV_TEXT_ALIGN_CENTER);
-    weather_forecast_labels_[1] = CreateLabel(screen, 210, 224, 56, "周三\n28°/23°", LV_TEXT_ALIGN_CENTER);
-    weather_forecast_labels_[2] = CreateLabel(screen, 270, 224, 60, "周四\n27°/22°", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[0] = CreateLabel(screen, label_x[0], 226, 58, "周二\n31°/24°", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[1] = CreateLabel(screen, label_x[1], 226, 58, "周三\n28°/23°", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[2] = CreateLabel(screen, label_x[2], 226, 58, "周四\n27°/22°", LV_TEXT_ALIGN_CENTER);
 
-    CreateBitmapIcon(screen, 360, 146, &ep_icon_todo_20);
-    CreateLabel(screen, 386, 149, 132, "今日待办");
-    todo_labels_[0] = CreateLabel(screen, 362, 182, 156, "");
-    todo_labels_[1] = CreateLabel(screen, 362, 219, 156, "");
-    todo_labels_[2] = CreateLabel(screen, 362, 256, 156, "");
+    CreateBitmapIcon(screen, 362, 146, &ep_icon_todo_20);
+    auto* todo_title = CreateLabel(screen, 388, 149, 132, "今日待办");
+    one_line(todo_title);
+    todo_labels_[0] = CreateLabel(screen, 362, 184, 158, "");
+    todo_labels_[1] = CreateLabel(screen, 362, 224, 158, "");
+    todo_labels_[2] = CreateLabel(screen, 362, 264, 158, "");
+    for (auto* label : todo_labels_) one_line(label, 19);
 
-    CreateBitmapIcon(screen, 548, 146, &ep_icon_commute_20);
-    CreateBitmapIcon(screen, 548, 183, &ep_icon_parcel_20);
-    CreateBitmapIcon(screen, 548, 220, &ep_icon_home_20);
-    CreateBitmapIcon(screen, 548, 257, &ep_icon_market_20);
-    quick_labels_[0] = CreateLabel(screen, 574, 149, 205, "");
-    quick_labels_[1] = CreateLabel(screen, 574, 186, 205, "");
-    quick_labels_[2] = CreateLabel(screen, 574, 223, 205, "");
-    quick_labels_[3] = CreateLabel(screen, 574, 260, 205, "");
+    const int quick_y[4] = {149, 186, 223, 260};
+    CreateBitmapIcon(screen, 550, 146, &ep_icon_commute_20);
+    CreateBitmapIcon(screen, 550, 183, &ep_icon_parcel_20);
+    CreateBitmapIcon(screen, 550, 220, &ep_icon_home_20);
+    CreateBitmapIcon(screen, 550, 257, &ep_icon_market_20);
+    for (int i = 0; i < 4; ++i) {
+        quick_labels_[i] = CreateLabel(screen, 576, quick_y[i], 202, "");
+        one_line(quick_labels_[i], 19);
+    }
 
     CreateBitmapIcon(screen, 18, 313, &ep_icon_word_20);
-    CreateLabel(screen, 42, 316, 226, "每日记单词");
-    word_label_ = CreateLabel(screen, 18, 341, 250, "abandon");
-    phonetic_label_ = CreateLabel(screen, 18, 363, 250, "/əˈbændən/");
-    meaning_label_ = CreateLabel(screen, 18, 385, 250, "放弃；遗弃");
-    example_label_ = CreateLabel(screen, 18, 411, 255, "例：Don't abandon your plan.");
-    word_footer_label_ = CreateLabel(screen, 18, 452, 255, "20词 · 30分钟轮播 · 1/20");
+    auto* word_title = CreateLabel(screen, 42, 316, 226, "每日记单词");
+    one_line(word_title);
+    word_label_ = CreateLabel(screen, 18, 343, 250, "abandon");
+    one_line(word_label_, 20);
+    phonetic_label_ = CreateLabel(screen, 18, 366, 250, "/əˈbændən/");
+    one_line(phonetic_label_, 20);
+    meaning_label_ = CreateLabel(screen, 18, 390, 250, "放弃；遗弃");
+    one_line(meaning_label_, 20);
+    example_label_ = CreateLabel(screen, 18, 416, 255, "例：Don't abandon your plan.");
+    lv_obj_set_height(example_label_, 30);
+    lv_label_set_long_mode(example_label_, LV_LABEL_LONG_WRAP);
+    word_footer_label_ = CreateLabel(screen, 18, 451, 255, "20词 · 30分钟轮播 · 1/20");
+    one_line(word_footer_label_, 18);
 
     user_label_ = CreateLabel(screen, 310, 319, 468, "你：等待你说话");
-    CreateBitmapIcon(screen, 310, 349, &ep_icon_mic_20);
-    assistant_label_ = CreateLabel(screen, 334, 352, 444, "小智：准备好了，随时可以聊。");
-    CreateBitmapIcon(screen, 310, 447, &ep_icon_mic_20);
-    CreateLabel(screen, 334, 450, 444,
-                "说“小智小智”唤醒｜按键说话｜天气 · 日程 · 提醒 · 设备");
+    lv_obj_set_height(user_label_, 25);
+    lv_label_set_long_mode(user_label_, LV_LABEL_LONG_DOT);
+    CreateBitmapIcon(screen, 310, 350, &ep_icon_mic_20);
+    assistant_label_ = CreateLabel(screen, 336, 352, 442, "小智：准备好了，随时可以聊。");
+    lv_obj_set_height(assistant_label_, 78);
+    lv_label_set_long_mode(assistant_label_, LV_LABEL_LONG_WRAP);
+    CreateBitmapIcon(screen, 310, 446, &ep_icon_mic_20);
+    auto* chat_hint = CreateLabel(screen, 336, 449, 442,
+                                  "语音唤醒｜按键说话｜天气 · 日程 · 提醒");
+    one_line(chat_hint, 18);
 
     UpdateClockLocked(true);
     UpdateHeaderLocked();
@@ -499,9 +539,8 @@ void EpaperDisplayT42::UpdateClockLocked(bool force) {
     std::time_t now = std::time(nullptr);
     struct tm local = {};
     if (!ValidSystemTime(now, &local)) {
-        if (force) {
-            if (date_label_ != nullptr) lv_label_set_text(date_label_, "等待时间同步 · 中国时区");
-            if (lunar_label_ != nullptr) lv_label_set_text(lunar_label_, "农历日期");
+        if (force && date_label_ != nullptr) {
+            lv_label_set_text(date_label_, "等待时间同步 · 中国时区");
         }
         return;
     }
@@ -514,16 +553,16 @@ void EpaperDisplayT42::UpdateClockLocked(bool force) {
     SetClockDigit(2, local.tm_min / 10);
     SetClockDigit(3, local.tm_min % 10);
 
-    char date[96];
-    std::snprintf(date, sizeof(date), "%d月%d日 %s · %s",
-                  local.tm_mon + 1, local.tm_mday, WeekdayName(local.tm_wday),
-                  dashboard_.weather.city.empty() ? data_provider_.config().city.c_str()
-                                                  : dashboard_.weather.city.c_str());
-    if (date_label_ != nullptr) lv_label_set_text(date_label_, date);
-
     const std::string lunar = epaper_dashboard::FormatLunarDate(
         local.tm_year + 1900, local.tm_mon + 1, local.tm_mday);
-    if (lunar_label_ != nullptr) lv_label_set_text(lunar_label_, lunar.c_str());
+
+    // Date + weekday + lunar date share one crisp baseline. Location already
+    // appears in the weather card, so the clock card stays uncluttered.
+    char date[128];
+    std::snprintf(date, sizeof(date), "%d月%d日 %s · %s",
+                  local.tm_mon + 1, local.tm_mday, WeekdayName(local.tm_wday),
+                  lunar.c_str());
+    if (date_label_ != nullptr) lv_label_set_text(date_label_, date);
 
     last_clock_minute_ = minute_key;
     last_clock_yday_ = local.tm_yday;
