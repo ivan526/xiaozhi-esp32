@@ -1,1 +1,2 @@
 Trigger GitHub Actions for ci/epaper-t42-v2.4.2 after enabling Actions.
+UI assets/font upgrade build trigger: 2026-08-19T21:20+08:00
