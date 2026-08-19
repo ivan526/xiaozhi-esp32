@@ -1,1 +1,1 @@
-2026-08-19 Inksight-inspired 1bpp typography + aligned grid + date/lunar single-line refinement
+2026-08-19 CJK completeness + 16px crisp raster + single-line compact lunar date
