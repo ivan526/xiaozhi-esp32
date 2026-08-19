@@ -1,0 +1,35 @@
+name: Apply e-paper UI upgrade
+
+on:
+  push:
+    branches:
+      - ci/epaper-t42-v2.4.2
+    paths:
+      - UI_UPGRADE_TRIGGER.txt
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/epaper-t42-v2.4.2
+          fetch-depth: 0
+      - name: Apply graphics and font upgrade
+        run: python3 scripts/epaper_ui_upgrade.py
+      - name: Commit generated assets and source changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main/CMakeLists.txt \
+                  main/boards/bread-compact-esp32/epaper_dashboard_icons.h \
+                  main/boards/bread-compact-esp32/epaper_display_t42.cc
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          git commit -m "feat: sharpen e-paper UI graphics and typography"
+          git push origin HEAD:ci/epaper-t42-v2.4.2
