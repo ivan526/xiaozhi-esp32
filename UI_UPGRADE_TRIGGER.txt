@@ -1,0 +1,1 @@
+2026-08-19 high-fidelity e-paper graphics + 16px/4bpp typography upgrade
