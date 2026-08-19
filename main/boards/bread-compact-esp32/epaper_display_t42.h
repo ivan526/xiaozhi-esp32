@@ -49,8 +49,6 @@ private:
         REFRESH_QUICK   = 1u << 4,
         REFRESH_WORD    = 1u << 5,
         REFRESH_CHAT    = 1u << 6,
-        // Date/lunar only need a larger clock-card refresh when the local day
-        // changes. Normal minute ticks use the much smaller REFRESH_CLOCK area.
         REFRESH_DATE    = 1u << 7,
         REFRESH_FULL    = 1u << 31,
     };
@@ -67,6 +65,8 @@ private:
 
     bool ready_ = false;
     bool panel_powered_ = false;
+    bool controller_hibernating_ = true;
+    bool panel_ram_valid_ = false;
     bool full_refresh_done_ = false;
     uint32_t partial_refresh_count_ = 0;
 
@@ -160,6 +160,7 @@ private:
     bool RefreshPanelFull();
     bool RefreshPanelPartial(uint32_t mask);
     bool RefreshPartialRegion(int x_start, int y_start, int x_end, int y_end, const char* name);
+    void PowerOffPanel();
     void SleepPanel();
 };
 
