@@ -2,6 +2,7 @@
 
 #include "assets/lang_config.h"
 #include "config.h"
+#include "epaper_dashboard_icons.h"
 #include "lunar_calendar.h"
 
 #include <algorithm>
@@ -65,7 +66,7 @@ inline bool PixelIsBlack(uint16_t p) {
     const uint32_t g6 = (p >> 5) & 0x3F;
     const uint32_t b6 = (p & 0x1F) << 1;
     const uint32_t luminance = r6 * 19 + g6 * 38 + b6 * 7; // weights sum to 64
-    return luminance < (32u * 64u);
+    return luminance < (42u * 64u); // thicken 4bpp anti-aliased text for 1-bit e-paper
 }
 
 void StyleSolidBlack(lv_obj_t* obj) {
@@ -74,6 +75,25 @@ void StyleSolidBlack(lv_obj_t* obj) {
     lv_obj_set_style_border_width(obj, 0, 0);
     lv_obj_set_style_pad_all(obj, 0, 0);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+lv_obj_t* CreateBitmapIcon(lv_obj_t* parent, int x, int y, const lv_image_dsc_t* src) {
+    lv_obj_t* img = lv_image_create(parent);
+    lv_image_set_src(img, src);
+    lv_obj_set_pos(img, x, y);
+    lv_obj_clear_flag(img, LV_OBJ_FLAG_SCROLLABLE);
+    return img;
+}
+
+const lv_image_dsc_t* WeatherBitmap(int code) {
+    if (code == 0) return &ep_icon_weather_sun_40;
+    if (code == 1 || code == 2) return &ep_icon_weather_partly_40;
+    if (code == 3) return &ep_icon_weather_cloud_40;
+    if (code == 45 || code == 48) return &ep_icon_weather_fog_40;
+    if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return &ep_icon_weather_rain_40;
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86) return &ep_icon_weather_snow_40;
+    if (code >= 95) return &ep_icon_weather_thunder_40;
+    return &ep_icon_weather_cloud_40;
 }
 
 } // namespace
@@ -267,6 +287,8 @@ lv_obj_t* EpaperDisplayT42::CreateLabel(
     lv_obj_set_style_text_color(label, lv_color_black(), 0);
     lv_obj_set_style_text_font(label, &BUILTIN_TEXT_FONT, 0);
     lv_obj_set_style_text_align(label, align, 0);
+    lv_obj_set_style_text_line_space(label, 1, 0);
+    lv_obj_set_style_text_opa(label, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(label, 0, 0);
     return label;
@@ -374,7 +396,7 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     date_label_ = CreateLabel(screen, 20, 91, 298, "日期");
     lunar_label_ = CreateLabel(screen, 20, 111, 298, "农历");
 
-    CreateSymbolLabel(screen, 354, 18, 20, LV_SYMBOL_AUDIO);
+    CreateBitmapIcon(screen, 352, 14, &ep_icon_robot_24);
     CreateLabel(screen, 380, 18, 245, "小智桌面屏");
     CreateSymbolLabel(screen, 704, 18, 24, LV_SYMBOL_WIFI, LV_TEXT_ALIGN_CENTER);
     CreateSymbolLabel(screen, 742, 18, 24, LV_SYMBOL_USB, LV_TEXT_ALIGN_CENTER);
@@ -382,34 +404,37 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     CreateSymbolLabel(screen, 354, 82, 20, LV_SYMBOL_BELL);
     CreateLabel(screen, 380, 82, 390, "语音唤醒｜天气 · 日程 · 提醒 · 设备状态");
 
-    CreateSymbolLabel(screen, 18, 148, 20, LV_SYMBOL_GPS);
+    CreateBitmapIcon(screen, 18, 146, &ep_icon_location_20);
     weather_title_label_ = CreateLabel(screen, 43, 148, 285, "当前位置 · 天气");
-    const int badge_x[4] = {30, 108, 186, 264};
-    for (int i = 0; i < 4; ++i) {
-        weather_icon_labels_[i] = CreateWeatherBadge(screen, badge_x[i], 174, 34, "云");
+    // High-fidelity weather composition: current conditions on the left,
+    // three compact forecast columns on the right, all using real I1 bitmaps.
+    weather_icon_labels_[0] = CreateBitmapIcon(screen, 18, 181, &ep_icon_weather_partly_40);
+    weather_current_label_ = CreateLabel(screen, 62, 178, 92, "今日 多云\n30°/24°");
+    weather_aqi_label_ = CreateLabel(screen, 62, 230, 92, "AQI 52 优");
+    const int wx[3] = {158, 218, 278};
+    for (int i = 0; i < 3; ++i) {
+        weather_icon_labels_[i + 1] = CreateBitmapIcon(screen, wx[i], 179, &ep_icon_weather_cloud_40);
     }
-    weather_current_label_ = CreateLabel(screen, 10, 214, 74, "28° 多云", LV_TEXT_ALIGN_CENTER);
-    weather_aqi_label_ = CreateLabel(screen, 10, 263, 74, "AQI 52优", LV_TEXT_ALIGN_CENTER);
-    weather_forecast_labels_[0] = CreateLabel(screen, 87, 214, 75, "周二\n31°/24°", LV_TEXT_ALIGN_CENTER);
-    weather_forecast_labels_[1] = CreateLabel(screen, 165, 214, 75, "周三\n28°/23°", LV_TEXT_ALIGN_CENTER);
-    weather_forecast_labels_[2] = CreateLabel(screen, 243, 214, 82, "周四\n27°/22°", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[0] = CreateLabel(screen, 150, 224, 56, "周二\n31°/24°", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[1] = CreateLabel(screen, 210, 224, 56, "周三\n28°/23°", LV_TEXT_ALIGN_CENTER);
+    weather_forecast_labels_[2] = CreateLabel(screen, 270, 224, 60, "周四\n27°/22°", LV_TEXT_ALIGN_CENTER);
 
-    CreateSymbolLabel(screen, 362, 149, 20, LV_SYMBOL_BELL);
+    CreateBitmapIcon(screen, 360, 146, &ep_icon_todo_20);
     CreateLabel(screen, 386, 149, 132, "今日待办");
     todo_labels_[0] = CreateLabel(screen, 362, 182, 156, "");
     todo_labels_[1] = CreateLabel(screen, 362, 219, 156, "");
     todo_labels_[2] = CreateLabel(screen, 362, 256, 156, "");
 
-    CreateSymbolLabel(screen, 548, 149, 20, LV_SYMBOL_DRIVE);
-    CreateSymbolLabel(screen, 548, 186, 20, LV_SYMBOL_ENVELOPE);
-    CreateSymbolLabel(screen, 548, 223, 20, LV_SYMBOL_HOME);
-    CreateSymbolLabel(screen, 548, 260, 20, LV_SYMBOL_BARS);
+    CreateBitmapIcon(screen, 548, 146, &ep_icon_commute_20);
+    CreateBitmapIcon(screen, 548, 183, &ep_icon_parcel_20);
+    CreateBitmapIcon(screen, 548, 220, &ep_icon_home_20);
+    CreateBitmapIcon(screen, 548, 257, &ep_icon_market_20);
     quick_labels_[0] = CreateLabel(screen, 574, 149, 205, "");
     quick_labels_[1] = CreateLabel(screen, 574, 186, 205, "");
     quick_labels_[2] = CreateLabel(screen, 574, 223, 205, "");
     quick_labels_[3] = CreateLabel(screen, 574, 260, 205, "");
 
-    CreateSymbolLabel(screen, 18, 316, 20, LV_SYMBOL_EDIT);
+    CreateBitmapIcon(screen, 18, 313, &ep_icon_word_20);
     CreateLabel(screen, 42, 316, 226, "每日记单词");
     word_label_ = CreateLabel(screen, 18, 341, 250, "abandon");
     phonetic_label_ = CreateLabel(screen, 18, 363, 250, "/əˈbændən/");
@@ -418,9 +443,9 @@ void EpaperDisplayT42::BuildDashboardUi(lv_obj_t* screen) {
     word_footer_label_ = CreateLabel(screen, 18, 452, 255, "20词 · 30分钟轮播 · 1/20");
 
     user_label_ = CreateLabel(screen, 310, 319, 468, "你：等待你说话");
-    CreateSymbolLabel(screen, 310, 352, 20, LV_SYMBOL_AUDIO);
+    CreateBitmapIcon(screen, 310, 349, &ep_icon_mic_20);
     assistant_label_ = CreateLabel(screen, 334, 352, 444, "小智：准备好了，随时可以聊。");
-    CreateSymbolLabel(screen, 310, 450, 20, LV_SYMBOL_AUDIO);
+    CreateBitmapIcon(screen, 310, 447, &ep_icon_mic_20);
     CreateLabel(screen, 334, 450, 444,
                 "说“小智小智”唤醒｜按键说话｜天气 · 日程 · 提醒 · 设备");
 
@@ -518,20 +543,17 @@ void EpaperDisplayT42::UpdateWeatherLocked() {
                   w.city.c_str(), w.live ? "定位天气" : "静态", w.updated.c_str());
     lv_label_set_text(weather_title_label_, buf);
 
-    lv_label_set_text(weather_icon_labels_[0],
-                      epaper_dashboard::DashboardDataProvider::WeatherGlyph(w.current_code));
+    lv_image_set_src(weather_icon_labels_[0], WeatherBitmap(w.current_code));
     for (int i = 0; i < 3; ++i) {
-        lv_label_set_text(weather_icon_labels_[i + 1],
-                          epaper_dashboard::DashboardDataProvider::WeatherGlyph(
-                              w.days[i + 1].weather_code));
+        lv_image_set_src(weather_icon_labels_[i + 1], WeatherBitmap(w.days[i + 1].weather_code));
     }
 
-    std::snprintf(buf, sizeof(buf), "%d° %s",
-                  w.current_temp,
-                  epaper_dashboard::DashboardDataProvider::WeatherText(w.current_code));
+    std::snprintf(buf, sizeof(buf), "今日 %s\n%d°/%d°",
+                  epaper_dashboard::DashboardDataProvider::WeatherText(w.current_code),
+                  w.days[0].temp_max, w.days[0].temp_min);
     lv_label_set_text(weather_current_label_, buf);
 
-    std::snprintf(buf, sizeof(buf), "AQI %d%s", w.aqi, w.aqi_grade.c_str());
+    std::snprintf(buf, sizeof(buf), "AQI %d %s", w.aqi, w.aqi_grade.c_str());
     lv_label_set_text(weather_aqi_label_, buf);
 
     std::time_t now = std::time(nullptr);
